@@ -10,3 +10,17 @@ riderModule.iml
 .artifacts/
 tmp/
 __pycache__/
+*.py[cod]
+.vs/
+*.user
+*.suo
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+*.log
+# Keep only the canonical workbook from generated output.
+/output/*
+!/output/pdf/
+/output/pdf/*
+!/output/pdf/workout-tracker-dotnet10-revised-plan.pdf
