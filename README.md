@@ -1,6 +1,6 @@
 # Kilo
 
-The current implementation covers the foundation (slice 01) and verified release images (slice 02) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, pooled Postgres, readiness, and a separate SQL migrator. Local Compose setup is also present; its remaining slice 03 gates come next. Clerk and business endpoints arrive in later slices.
+The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, pooled Postgres, readiness, and a separate SQL migrator. Clerk and business endpoints arrive in later slices.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
 
@@ -39,6 +39,26 @@ Invoke-WebRequest http://127.0.0.1:8080/health
 Compose waits for Postgres, runs the migrator once, then starts the API. The development override exposes API 8080 and Postgres 5432 on loopback. The base `compose.yaml` publishes no ports; production roles, TLS, and deployment are later slices. `/openapi/v1.json` is available in Development. No business controller is deployed yet.
 
 An existing Postgres volume keeps its existing database names/passwords. Match its credentials rather than deleting the volume. New SQL scripts are additive; never edit an already-applied migration. For a new release, run its migrator freshly rather than relying on a previous container's success.
+
+For a local code/schema update, stop the API and remove the completed migration container before starting the rebuilt stack:
+
+```powershell
+docker compose stop api
+docker compose rm --stop --force migrations
+docker compose up --build -d
+```
+
+This preserves the database volume and makes migration success gate API startup. Because dependency conditions gate startup, stop the API first when updating the schema ([Compose startup behavior](https://docs.docker.com/compose/how-tos/startup-order/)).
+
+Run the repeatable slice 03 gate with PowerShell 7, Git, Docker in Linux mode, and Compose 2.24.4 or newer:
+
+```powershell
+pwsh -NoProfile -File scripts/verify-compose.ps1 -Platform linux/amd64
+```
+
+It builds uniquely tagged images from a source snapshot, uses a unique Compose project and database volume, generates a temporary password, and replaces the development ports with random loopback ports. The check verifies startup order, data survival after container recreation, failure/rollback of a new migration, blocked API startup, repair and repeatability, and base/development configuration. The bad migration exists only in the temporary copy. Cleanup removes that project's containers, network, volume, image tags, and temporary sources; only sanitized evidence remains under ignored `.artifacts`. Existing `.env` values and development resources are preserved. The temporary port replacement uses Compose's native [`!override` tag](https://docs.docker.com/reference/compose-file/merge/).
+
+All slice 03 gates passed; see the [verification record](docs/slice-03-verification.md).
 
 ## Native development
 
