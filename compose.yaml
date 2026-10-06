@@ -1,0 +1,41 @@
+services:
+  api:
+    image: kilo
+    build:
+      context: .
+      dockerfile: Kilo/Dockerfile
+    environment:
+      ConnectionStrings__Postgres: "Host=db;Database=kilo;Username=postgres;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env};Timeout=3;Command Timeout=15;GSS Encryption Mode=Disable"
+      ASPNETCORE_HTTP_PORTS: 8080
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  migrations:
+    image: kilo-migrations
+    build:
+      context: .
+      dockerfile: Kilo.Migrations/Dockerfile
+    environment:
+      ConnectionStrings__Postgres: "Host=db;Database=kilo;Username=postgres;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env};Timeout=3;Command Timeout=15;GSS Encryption Mode=Disable"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+  db:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: kilo
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d kilo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:

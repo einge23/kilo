@@ -1,0 +1,12 @@
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+.idea/
+.env
+.env.*
+!.env.example
+.artifacts/
+tmp/
+__pycache__/
