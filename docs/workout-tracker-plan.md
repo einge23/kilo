@@ -2,9 +2,9 @@
 
 ## A cumulative .NET 10 implementation workbook
 
-Controllers / Dapper / PostgreSQL / Clerk / Docker Compose / Linux
+Controllers / EF Core 10 / PostgreSQL / Clerk / Docker Compose / Linux
 
-Rebuilt October 6, 2026. Integer IDs. Imperial defaults with explicit lb/kg weights. Routine templates stay separate from workout snapshots.
+Revised October 7, 2026 for EF Core. Integer IDs. Imperial defaults with explicit lb/kg weights. Routine templates stay separate from workout snapshots.
 
 This is a revised implementation plan, not a completed application. The original PDF supplies the product requirements; its code recipes are reference material, not instructions to execute. This revision supersedes those recipes.
 
@@ -12,7 +12,7 @@ This is a revised implementation plan, not a completed application. The original
 
 Build slices 01-20 in order. Each slice states what already exists, the new work, the implementation sequence, and a concrete verification gate. Earlier code remains in place unless a later slice explicitly changes it. No N-number lookup is required.
 
-Slice 01 contains complete foundation recipes. Later snippets illustrate the stated change and are labeled when partial. The API catalog and migration reference describe the final product; they are not a request to implement future slices early.
+Slice 01 explains the foundation and its repository implementation. Snippets are labeled when partial; later notes extend earlier work. The API catalog and schema contracts describe the final product; they are not a request to implement future slices early.
 
 Use each slice's fillable progress panel for implementation, verification, status, review date, and evidence. Mark Done only when its gate passes. Save the filled PDF in a reader that supports AcroForms.
 
@@ -21,9 +21,9 @@ Use each slice's fillable progress panel for implementation, verification, statu
 - Program.cs composes the host; focused IServiceCollection extensions own API, persistence, and later Clerk registrations.
 - Asp.Versioning.Mvc supplies URL-segment versioning. It replaces the hand-built ApiV1Controller routing base.
 - Native MVC validation returns 400. The previous custom 422 split is intentionally removed before the first client is built.
-- Native health checks replace a custom health controller. Native Npgsql connections and transactions replace DapperDb/DbSession wrappers.
-- SQL migrations grow with the slices. There is one fresh-install path, not separate fresh and legacy ALTER scripts mixed together.
-- Feature folders grow inside one API project. A separate migrator and a focused test project are justified; speculative architecture layers are deferred.
+- Native health checks use KiloDbContext.Database.CanConnectAsync. EF Core owns mapping, scoped contexts, pooled connections, and transactions.
+- Generated EF migrations and their model snapshot grow with the slices. The separate migrator applies them through MigrateAsync; a guarded one-time adoption path covers the retained users baseline.
+- Feature folders grow inside one API project. Kilo.Persistence shares the model and migrations between the API and separate migrator; Kilo.Tests verifies their behavior. No further architecture layers are needed.
 
 ---page---
 # Development order
@@ -66,9 +66,9 @@ Wednesday (3): Upper A. Thursday (4): Lower A. Friday (5): Abs and Arms. Saturda
 
 ## One API, feature folders, explicit dependencies
 
-Keep the existing Kilo and Kilo.Migrations project names. Start with Hosting for service registration and readiness. Add Features/Me, Exercises, Routines, Schedule, and Sessions only when their slice begins. Keep request/response contracts, SQL, and concrete services beside their feature. Move genuinely shared WeightDto or row mapping into a small Shared folder when a second feature needs it.
+Keep the existing Kilo and Kilo.Migrations project names. Start with Hosting for service registration and readiness. Add Features/Me, Exercises, Routines, Schedule, and Sessions only when their slice begins. Keep request/response contracts and real workflow services beside their API feature. Add entities and Fluent mappings to Kilo.Persistence only when used. Move a genuinely shared WeightDto into Shared when a second feature needs it.
 
-Controllers bind requests and translate outcomes into HTTP. Concrete repositories own SQL. Introduce a concrete workflow service for a multi-step transaction, not for forwarding one method call. Dapper already performs mapping; do not add AutoMapper, MediatR, generic repositories, a universal Result type, or four Clean Architecture projects.
+Controllers bind requests and translate outcomes into HTTP. Inject KiloDbContext directly for simple CRUD; extract a concrete workflow service for a real multi-step transaction. EF already supplies change tracking and a unit of work. Do not wrap it in repositories, a custom unit of work, AutoMapper, MediatR, a universal Result type, or four Clean Architecture projects.
 
 ## HTTP and validation
 
@@ -80,75 +80,75 @@ Created: 201 with Location. Read/update: 200. Archive/delete: 204. Missing/inval
 
 ## Database and time
 
-Pass CancellationToken through every async operation. Open/dispose a pooled Npgsql connection for each operation. Every Dapper CommandDefinition has the operation token, a bounded timeout, and the explicit transaction when one exists. All tenant queries include the verified local userId. Child foreign keys enforce ownership as a second defense.
+Register KiloDbContext with AddDbContext: one scoped context per request or migrator scope, never a singleton. Await operations sequentially; a context is not thread-safe. Pass CancellationToken to queries, SaveChangesAsync, transactions, and migrations. Use AsNoTracking and DTO projections for reads, tracked entities for writes, and a bounded provider command timeout. All tenant predicates include verified local userId; never use unscoped FindAsync for tenant resources. Composite foreign keys enforce ownership as a second defense.
 
-Postgres identity columns generate positive integer keys; gaps are normal. Clerk subjects and retry keys remain text. Use timestamptz for UTC instants and date for optional scheduled dates. Npgsql maps timestamptz to UTC DateTime; map dates explicitly to DateOnly at the repository boundary. Use TimeProvider for application-generated timestamps, including deterministic timer tests.
+Postgres identity columns generate positive integer keys; gaps are normal. Clerk subjects and retry keys remain text. Use timestamptz for UTC instants and date for optional scheduled dates. The Npgsql EF provider maps timestamptz to UTC DateTime and date to DateOnly; map both explicitly in the model. Use TimeProvider for application-generated timestamps, including deterministic timer tests.
 
-Standards basis: Microsoft controller behavior [1], Npgsql lifetime guidance [4], and Dapper APIs [5].
+SaveChanges is atomic for one batch. Begin an explicit transaction when locks, reads, or several saves must be atomic together. Use EF parameterized SQL only for a concrete PostgreSQL feature such as FOR UPDATE; keep ordinary CRUD in LINQ. Inspect DbUpdateException.InnerException for a known PostgreSQL SQLSTATE and constraint name before translating a conflict. Do not enable sensitive-data logging. Standards basis: controller behavior [1], the Npgsql EF provider [4], and EF queries/transactions [5, 15].
 
 ---page---
 # Growth map and migration policy
 
-## Add only the files the current slice uses
+## Add only files the current slice uses
 
 ```text
-Kilo.slnx
-global.json
+Kilo.slnx / global.json / .config/dotnet-tools.json
 Kilo/
   Program.cs
-  Hosting/
-    ApiServiceCollectionExtensions.cs
-    PersistenceServiceCollectionExtensions.cs
-    PostgresReadinessCheck.cs
+  Hosting/                  # API registrations and readiness
   Features/                 # added feature by feature
+Kilo.Persistence/
+  User.cs / KiloDbContext.cs
+  DatabaseServiceCollectionExtensions.cs
+  KiloDbContextFactory.cs    # design-time EF tooling
+  Migrations/               # generated C#, designers, model snapshot
 Kilo.Migrations/
-  Program.cs
-  Migrations/
-    001_users.sql
-Kilo.Tests/                 # foundation integration checks
+  Program.cs                # separate MigrateAsync executable
+  LegacyBaselineAdoption.cs # explicit known-baseline bridge
+Kilo.Tests/                 # real PostgreSQL and HTTP checks
 ```
 
-## One ordered, additive schema path
+## One ordered, additive EF schema path
 
-| First used | Migration | Adds |
+| First used | EF migration name | Adds |
 | --- | --- | --- |
-| 01 / 04 | 001_users.sql | Identity and preference storage |
-| 05 | 002_exercises.sql | Exercise library, optional brands |
-| 06 | 003_routines.sql | Routine metadata |
-| 07 | 004_routine_exercises.sql | Owned ordered placements |
-| 08 | 005_routine_sets.sql | Planned sets and weight pairs |
-| 09 | 006_routine_schedule.sql | One routine per user/weekday |
-| 10 | 007_sessions.sql | Sessions and complete snapshots |
-| 12 | 008_history_indexes.sql | History and previous-session indexes |
-| 14 | 009_rest_timer.sql | Timer columns, checks, child reference |
+| 01 / 04 | CreateUsers | Identity and preference storage |
+| 05 | AddExercises | Exercise library, optional brands |
+| 06 | AddRoutines | Routine metadata |
+| 07 | AddRoutineExercises | Owned ordered placements |
+| 08 | AddRoutineSets | Planned sets and weight pairs |
+| 09 | AddRoutineSchedule | One routine per user/weekday |
+| 10 | AddSessions | Sessions and complete snapshots |
+| 12 | AddHistoryIndexes | History and previous-session indexes |
+| 14 | AddRestTimer | Timer columns, checks, child reference |
 
-Archive columns and active-position indexes belong to their original table migrations. Archive endpoints and reorder behavior arrive in 15. Session result and lifecycle columns belong to 007 so a session is a complete persisted model in 10; result writes arrive in 11. Timer columns arrive in 14.
+EF prefixes generated files with a timestamp. Add entities/mappings, run dotnet ef migrations add, and review the generated migration, designer, and model snapshot together. Do not hand-maintain the snapshot, change an applied migration, or recreate retained data with EnsureCreated. The SQL appendix expresses schema contracts, not executable migration files.
 
-Run all outstanding embedded scripts through DbUp, in filename order, transactionally per script, with a migration journal. Repeating the migrator means no applied script reruns; it does not mean adding IF NOT EXISTS everywhere. Never modify or rename a script already applied to a database you retain. Run only one migrator per deployment.
+Archive columns and active-position indexes belong to the original table migrations. Session result/lifecycle fields belong to AddSessions; result writes arrive in 11. Timer fields arrive in 14. Add only User in 01; future tables remain future work.
 
-The users baseline is deliberately small and concrete: it proves the schema pipeline and is reused in 04. No exercise, routine, or workout tables are needed for 01. Readiness checks connectivity to the configured database; deployment additionally gates on migration success and an authenticated smoke test.
+The separate executable calls Database.MigrateAsync and records public.__EFMigrationsHistory. Repeat runs apply only pending migrations. EF owns locking and normal migration transactions; do not wrap MigrateAsync in an application transaction or promise the whole release rolls back. Review generated operations that suppress transactions. Run one migrator per deployment and activate the API only after success [8].
 
-This is a new app plan. Legacy UUID-to-int imports and pounds-only upgrade scripts are deferred until a real retained legacy database is identified. If one exists, stop before replacing it, inventory its schema, back it up, and design a mapped migration.
+The existing pre-EF users baseline has an explicit adoption path described below. Unknown schemas, UUID imports, and pounds-only conversions require separate inventory and migration design; never infer a baseline or delete the volume to make startup pass.
 
 ---page---
 # Slice 01 - Foundation scope and setup
 
 ## Outcome
 
-A .NET 10 controller host, package-managed API versioning, pooled persistence, sanitized errors, a public readiness endpoint, and a separate repeatable migration command. No Clerk configuration or feature repository is required yet.
+A .NET 10 controller host, native API versioning, EF persistence, sanitized errors, public readiness, and a separate repeatable EF migrator. No Clerk or workout feature is implemented yet.
 
 ## Starting point in this workspace
 
-Kilo.slnx already references Kilo and Kilo.Migrations. Their current source is unfinished: Program.cs contains duplicate registrations/builds and references future types; global.json uses runtime-style 10.0.0 instead of a valid SDK version. Preserve any useful project setup and replace startup coherently when implementing this slice.
+Slices 01-03 already exist. This revision converts their persistence to EF while preserving integer keys, column names/defaults/checks, and existing local volumes. Kilo.Persistence is shared by the two executables; it is not an extra application layer.
 
 ## Build sequence
 
-1. Correct global.json and confirm dotnet --version selects a stable 10.0 SDK. Keep net10.0, Nullable, and ImplicitUsings in both projects.
-2. Keep Microsoft.AspNetCore.OpenApi in Kilo. Add Asp.Versioning.Mvc; keep Dapper and Npgsql. JwtBearer is used in 04. Do not add the deprecated Microsoft.AspNetCore.Mvc.Versioning package.
-3. Keep dbup-postgresql and Microsoft.Extensions.Hosting in the migrator. The web SDK already supplies configuration APIs; remove redundant web-project Microsoft.Extensions.Configuration package references when safe.
-4. Create the two registration extensions and readiness check shown on the next pages. Program.cs only composes them.
-5. Add 001_users.sql and embed Migrations/*.sql. Configure ConnectionStrings:Postgres separately for each executable.
-6. Build, run migrations twice against a disposable Postgres database, then exercise readiness. Add the focused checks described in the gate.
+1. Keep net10.0, nullable reference types, implicit usings, and the existing valid SDK selection. Commit package locks and restore in locked mode.
+2. Retain Asp.Versioning.Mvc and Microsoft.AspNetCore.OpenApi in Kilo. Reference Kilo.Persistence from the API and migrator.
+3. In Persistence pin Microsoft.EntityFrameworkCore.Relational 10.0.12, Microsoft.EntityFrameworkCore.Design 10.0.12 (PrivateAssets=all), Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3, and configuration environment support 10.0.12. Keep Hosting 10.0.12 in the migrator. The provider brings Npgsql; remove the former data-access packages.
+4. Add User, KiloDbContext, shared database registration, and a design-time factory. Keep API hosting extensions and slim Program.cs.
+5. Pin dotnet-ef 10.0.12 in the local tool manifest. Generate CreateUsers in Persistence/Migrations; commit its designer and model snapshot. Never generate future tables in this baseline.
+6. Run the separate migrator twice against a disposable real Postgres database, check readiness, and run the foundation suite. Adopt retained pre-EF databases only through the explicit audited path.
 
 ## SDK selection
 
@@ -162,7 +162,7 @@ Kilo.slnx already references Kilo and Kilo.Migrations. Their current source is u
 }
 ```
 
-10.0.100 is a valid minimum installed SDK, not a claim about the newest SDK. For reproducible release builds, select an exact approved SDK and compatible container digest; with locked package graphs, use rollForward=disable in CI. Record resolved package versions and commit packages.lock.json. Never copy a guessed future patch number. SDK selection: [6].
+10.0.100 is a valid minimum installed SDK. Release images use approved pinned digests; review SDK and dependency updates deliberately. Use an exact approved SDK with rollForward=disable in reproducible CI [6].
 
 ---page---
 # Slice 01 - Program.cs and API services
@@ -225,48 +225,32 @@ Keep middleware ordering visible. Do not add a second app.Build(), a self-check 
 ---page---
 # Slice 01 - Persistence registration
 
-## Hosting/PersistenceServiceCollectionExtensions.cs
+## Kilo.Persistence / shared native registration
 
-Complete registration. DI owns one data source; requests own short-lived connections. No singleton NpgsqlConnection and no custom connection/transaction wrapper.
+AddKiloDatabase validates ConnectionStrings:Postgres once, then registers the scoped context for either executable. It rejects blank/malformed settings or missing Host/Database with a key-only diagnostic. No database I/O occurs during registration.
 
 ```csharp
-using Npgsql;
+services.AddDbContext<KiloDbContext>(options =>
+    options.UseNpgsql(connection, postgres => postgres
+        .CommandTimeout(15)
+        .MigrationsHistoryTable("__EFMigrationsHistory", "public")));
+```
+
+This is the registration body, with connection supplied by the shared validator. Use the same options in the design-time factory. The provider manages pooled connections; do not register a singleton context or add a connection wrapper.
+
+## Kilo/Hosting/PersistenceServiceCollectionExtensions.cs
+
+```csharp
+using Kilo.Persistence;
 
 namespace Kilo.Hosting;
 
 public static class PersistenceServiceCollectionExtensions
 {
     public static IServiceCollection AddKiloPersistence(
-        this IServiceCollection services, IConfiguration config)
+        this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = config.GetConnectionString("Postgres");
-        if (string.IsNullOrWhiteSpace(connectionString))
-            throw new InvalidOperationException(
-                "ConnectionStrings:Postgres is required.");
-
-        NpgsqlConnectionStringBuilder settings;
-        try
-        {
-            settings = new NpgsqlConnectionStringBuilder(connectionString);
-        }
-        catch (ArgumentException)
-        {
-            throw new InvalidOperationException(
-                "ConnectionStrings:Postgres is invalid.");
-        }
-
-        if (string.IsNullOrWhiteSpace(settings.Host)
-            || string.IsNullOrWhiteSpace(settings.Database))
-            throw new InvalidOperationException(
-                "Postgres Host and Database are required.");
-
-        services.AddSingleton<NpgsqlDataSource>(provider =>
-        {
-            var dataSource = new NpgsqlDataSourceBuilder(connectionString);
-            dataSource.UseLoggerFactory(
-                provider.GetRequiredService<ILoggerFactory>());
-            return dataSource.Build();
-        });
+        services.AddKiloDatabase(configuration);
         services.AddHealthChecks().AddCheck<PostgresReadinessCheck>(
             "postgres", timeout: TimeSpan.FromSeconds(3));
         return services;
@@ -274,25 +258,21 @@ public static class PersistenceServiceCollectionExtensions
 }
 ```
 
-Configuration errors name the key, not its value. Supply explicit connection/command timeouts, for example Timeout=3;Command Timeout=15 in development configuration. Do not enable SQL parameter-value logging. The data source pools connections and is disposed by the container [4].
-
-A well-formed connection string is configuration validity; an unreachable server is readiness failure. Do not perform schema writes in this registration factory.
+Supply Timeout=3;Command Timeout=15 in local connection configuration. Never expose its value in logs or exceptions, enable sensitive-data logging, or mutate schema while registering services. A well-formed connection string is configuration validity; an unreachable server is readiness failure.
 
 ---page---
 # Slice 01 - Native readiness and versioned controllers
 
 ## Hosting/PostgresReadinessCheck.cs
 
-Complete class. The linked token bounds pool acquisition and the query. Do not leak database error details into the response or return a caught exception in HealthCheckResult.
-
 ```csharp
+using Kilo.Persistence;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
-using Npgsql;
 
 namespace Kilo.Hosting;
 
-public sealed class PostgresReadinessCheck(NpgsqlDataSource source)
-    : IHealthCheck
+public sealed class PostgresReadinessCheck(KiloDbContext db) : IHealthCheck
 {
     public async Task<HealthCheckResult> CheckHealthAsync(
         HealthCheckContext context, CancellationToken ct = default)
@@ -302,17 +282,9 @@ public sealed class PostgresReadinessCheck(NpgsqlDataSource source)
         deadline.CancelAfter(TimeSpan.FromSeconds(3));
         try
         {
-            await using var connection =
-                await source.OpenConnectionAsync(deadline.Token);
-            await using var command = connection.CreateCommand();
-            command.CommandText = "SELECT 1";
-            command.CommandTimeout = 3;
-            await command.ExecuteScalarAsync(deadline.Token);
-            return HealthCheckResult.Healthy();
-        }
-        catch (NpgsqlException)
-        {
-            return HealthCheckResult.Unhealthy("Database unavailable.");
+            return await db.Database.CanConnectAsync(deadline.Token)
+                ? HealthCheckResult.Healthy()
+                : HealthCheckResult.Unhealthy("Database unavailable.");
         }
         catch (OperationCanceledException)
         {
@@ -322,7 +294,7 @@ public sealed class PostgresReadinessCheck(NpgsqlDataSource source)
 }
 ```
 
-GET /health uses the framework's short Healthy/Unhealthy text response and 200/503 status. It is the documented operational exception to JSON ProblemDetails. It needs no custom HealthController or health-check dependency package [7].
+Health checks resolve the context in their own scope. CanConnectAsync checks connectivity, not schema compatibility. GET /health returns native Healthy/Unhealthy text and 200/503. No custom health controller or third-party package is required [7]. Migration success separately gates release activation.
 
 ## Controller pattern - introduced with the first business controller in 04
 
@@ -332,68 +304,117 @@ GET /health uses the framework's short Healthy/Unhealthy text response and 200/5
 [Route("api/v{version:apiVersion}/me")]
 public sealed class MeController : ControllerBase
 {
-    // Slice 04 supplies the actual dependencies and actions.
+    // Slice 04 supplies actual dependencies and actions.
 }
 ```
 
-This pattern is partial, not a slice-one endpoint. There are no exercise routes to test yet. Test package matching with a test-only controller in 01; test real protected routes after 04. Positive ID constraints arrive with resource actions. No routing base class is needed.
+This is partial, not a slice-one endpoint. Use a test-only v1 controller for foundation routing checks. Positive ID constraints arrive with real resource actions.
 
 ---page---
 # Slice 01 - Separate migration executable
 
-## Kilo.Migrations/Program.cs - complete entry point
+## Kilo.Migrations/Program.cs - native EF runner
+
+The production entry point also validates configuration, clears data-bearing log providers, and optionally invokes the explicit baseline bridge. This is its core lifecycle; see the repository's complete Program.cs for those guards.
 
 ```csharp
-using DbUp;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
-
-var builder = Host.CreateApplicationBuilder(args);
-var connectionString = builder.Configuration
-    .GetConnectionString("Postgres");
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    Console.Error.WriteLine("ConnectionStrings:Postgres is required.");
-    return 1;
-}
-
+builder.Services.AddKiloDatabase(builder.Configuration);
+using var host = builder.Build();
+await host.StartAsync();
 try
 {
-    var upgrader = DeployChanges.To
-        .PostgresqlDatabase(connectionString)
-        .WithScriptsEmbeddedInAssembly(typeof(Program).Assembly)
-        .WithTransactionPerScript()
-        .Build();
-    var result = upgrader.PerformUpgrade();
-    if (!result.Successful)
-    {
-        Console.Error.WriteLine("Migration failed; release not activated.");
-        return 1;
-    }
+    await using var scope = host.Services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
+    var ct = host.Services.GetRequiredService<IHostApplicationLifetime>()
+        .ApplicationStopping;
+    await db.Database.MigrateAsync(ct);
 }
-catch (Exception)
+finally { await host.StopAsync(); }
+```
+
+Use Host.CreateApplicationBuilder for separate executable configuration and cancellation on SIGTERM. The executable boundary returns 1 with a sanitized diagnostic on failure, 0 with Migrations complete on success. Do not print provider exceptions, credentials, or SQL values. Unexpected migration failures must block release activation.
+
+The API never calls MigrateAsync, EnsureCreated, or tooling Database.Update. Production uses an application role for the API and a DDL role for this executable. Provision the database separately; do not make serving processes create it.
+
+## Generated baseline and tooling
+
+CreateUsers is generated from the User model below. EF discovers migrations compiled into Kilo.Persistence.dll, with their metadata and model snapshot. There are no embedded SQL resources or custom migration journal.
+
+KiloDbContextFactory implements IDesignTimeDbContextFactory<KiloDbContext>. It reads environment configuration and reuses the shared connection validator/options. The library generates its runtime configuration for CLI tooling and privately references EF Design. Tooling must not start the API or migrator. The factory requires ConnectionStrings__Postgres; it never guesses a database or inherits another executable's user secrets.
+
+---page---
+# Slice 01 - User model and schema mapping
+
+## Kilo.Persistence/User.cs
+
+```csharp
+public sealed class User
 {
-    Console.Error.WriteLine("Migrator failed; check protected diagnostics.");
-    return 1;
+    public int Id { get; set; }
+    public required string ClerkUserId { get; set; }
+    public string TimeZone { get; set; } = "UTC";
+    public string MeasurementSystem { get; set; } = "imperial";
+    public DateTime CreatedAt { get; set; }
 }
-
-Console.WriteLine("Migrations complete.");
-return 0;
 ```
 
-The top-level catch is an executable failure boundary. Avoid logging raw connection errors, credentials, or data-bearing SQL. Add safe script identity/timing through DbUp's logging hook when operational diagnostics are implemented. DbUp defaults to no transaction; WithTransactionPerScript is intentional [8]. A failed later script may leave earlier successful scripts journaled. Correct the unapplied failure and rerun; do not claim the whole release is one transaction.
+## KiloDbContext / OnModelCreating core
 
-## Kilo.Migrations.csproj additions and baseline
-
-```xml
-<ItemGroup>
-  <EmbeddedResource Include="Migrations/*.sql" />
-</ItemGroup>
+```csharp
+modelBuilder.HasDefaultSchema("public");
+var user = modelBuilder.Entity<User>();
+user.ToTable("users", table =>
+{
+    table.HasCheckConstraint("users_clerk_user_id_check",
+        "btrim(clerk_user_id) <> ''");
+    table.HasCheckConstraint("users_measurement_system_check",
+        "measurement_system IN ('imperial', 'metric')");
+});
+user.HasKey(x => x.Id).HasName("users_pkey");
+user.HasAlternateKey(x => x.ClerkUserId)
+    .HasName("users_clerk_user_id_key");
+user.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+user.Property(x => x.ClerkUserId)
+    .HasColumnName("clerk_user_id").HasColumnType("text");
+user.Property(x => x.TimeZone).HasColumnName("time_zone")
+    .HasColumnType("text").HasDefaultValue("UTC");
+user.Property(x => x.MeasurementSystem)
+    .HasColumnName("measurement_system")
+    .HasColumnType("text").HasDefaultValue("imperial");
+user.Property(x => x.CreatedAt).HasColumnName("created_at")
+    .HasColumnType("timestamp with time zone").HasDefaultValueSql("now()");
 ```
 
-001_users.sql creates users with integer identity PK, unique nonblank clerk_user_id, time_zone default UTC, measurement_system default imperial with an imperial/metric check, and created_at timestamptz default now(). The exact SQL appears in the migration reference. No manual BEGIN/COMMIT inside scripts; DbUp owns the transaction.
+KiloDbContext inherits DbContext, accepts DbContextOptions<KiloDbContext>, and exposes DbSet<User> Users. Keep this small mapping together. Split feature entity configurations with IEntityTypeConfiguration only when real growth warrants it. Explicit names retain the schema contract without a naming-convention dependency.
 
-The API uses an application role; the migrator uses a DDL role in production. The API never calls PerformUpgrade. The empty database itself is provisioned by local Postgres/Compose, not by every serving process.
+---page---
+# Slice 01 - Migration lifecycle and retained databases
+
+## Generate, review, then run the separate migrator
+
+```powershell
+dotnet tool restore
+# Supply a local connection securely via environment configuration.
+# The factory requires ConnectionStrings__Postgres for tooling.
+dotnet ef migrations add AddExercises --project Kilo.Persistence
+dotnet ef migrations has-pending-model-changes --project Kilo.Persistence
+dotnet ef migrations script --idempotent --project Kilo.Persistence
+dotnet run --project Kilo.Migrations
+```
+
+AddExercises is the example for slice 05, not a command to run now. Review both generated C# and provider SQL for loss, defaults, constraints, indexes, and lock cost. After generating the intended migration, pending-model checking must pass. Commit migration, designer, and snapshot together. Only the separate executable applies deployment migrations; script output is for review. Never use EnsureCreated alongside migrations [8].
+
+## Explicit adoption of the retained users baseline
+
+An existing pre-EF volume must not be treated as empty. Back it up, stop the API, and inventory its schema and old journal before running the flag below. README contains the exact Compose runbook.
+
+```powershell
+dotnet run --project Kilo.Migrations -- --adopt-legacy-baseline
+```
+
+The bridge recognizes only the previously shipped users baseline: exactly five expected columns/defaults/identity settings, the named checks and keys, one known journal entry, no other application tables or user triggers, and no applied EF migrations. It locks users, audits inside a transaction, and writes the CreateUsers history entry using the provider's native history scripts. It preserves all rows, IDs, sequence state, and the old journal as historical metadata, then applies pending EF migrations normally.
+
+Repeat ordinary migrations without the flag. Drift or an already-adopted database makes the flag fail; inspect and design a specific change instead of inventing history or editing an applied migration. The normal runner fails on an unadopted populated schema. Tests cover preservation and rejection against disposable legacy fixtures; they do not alter the user's local volume.
 
 ---page---
 # Slice 01 - Configuration and verification gate
@@ -406,7 +427,7 @@ Both projects already have distinct UserSecretsId values. Configure the same key
 $env:DOTNET_ENVIRONMENT = "Development"
 dotnet user-secrets set "ConnectionStrings:Postgres" "<connection>" --project Kilo
 dotnet user-secrets set "ConnectionStrings:Postgres" "<connection>" --project Kilo.Migrations
-dotnet restore Kilo.slnx --use-lock-file
+dotnet restore Kilo.slnx --locked-mode
 dotnet build Kilo.slnx --no-restore
 dotnet run --project Kilo.Migrations
 dotnet run --project Kilo.Migrations
@@ -423,9 +444,9 @@ The console migrator has no web launch profile: explicitly selecting Development
 ```powershell
 dotnet add Kilo package Asp.Versioning.Mvc --version 10.2.1
 dotnet add Kilo package Microsoft.AspNetCore.OpenApi --version 10.0.12
-dotnet add Kilo package Npgsql --version 10.0.3
-dotnet add Kilo package Dapper --version 2.1.89
-dotnet add Kilo.Migrations package dbup-postgresql --version 7.0.1
+dotnet add Kilo.Persistence package Npgsql.EntityFrameworkCore.PostgreSQL --version 10.0.3
+dotnet add Kilo.Persistence package Microsoft.EntityFrameworkCore.Relational --version 10.0.12
+# EF Design 10.0.12 is a private tooling reference; local dotnet-ef is pinned too.
 dotnet add Kilo.Migrations package Microsoft.Extensions.Hosting --version 10.0.12
 ```
 
@@ -436,14 +457,16 @@ These are verified package pins for recipe checks, not automatic update promises
 
 ## One focused runnable integration suite
 
-Create Kilo.Tests with the chosen stable xUnit runner and Microsoft.AspNetCore.Mvc.Testing 10.x. Use WebApplicationFactory<Program> and a disposable real Postgres database supplied by test configuration. Reuse that small harness for future slices. No mocks of Npgsql or an in-memory substitute for relational behavior.
+Create Kilo.Tests with the chosen stable xUnit runner and Microsoft.AspNetCore.Mvc.Testing 10.x. Use WebApplicationFactory<Program> and a disposable real Postgres database supplied by test configuration. Reuse that small harness for future slices. Use the real Npgsql EF provider; neither EF InMemory nor SQLite verifies PostgreSQL identity, constraints, and locking.
 
-- Migrate an empty database; assert users and the DbUp journal exist. Insert a fixture and rerun; assert the fixture and journal row count are unchanged.
+- Migrate an empty database; assert users and native EF migration history exist. Insert a fixture and rerun; assert the fixture and journal row count are unchanged.
 - Start with valid settings; GET /health returns 200. Stop the test DB or point to an unreachable endpoint; it returns 503 within the bounded check deadline plus transport overhead. Bring DB back; readiness recovers.
 - Missing/invalid connection configuration fails with a key-only diagnostic. Capture logs and assert test credentials are absent.
 - Add a test-assembly v1 probe controller through MVC ApplicationPart. /api/v1/probe resolves; unversioned and unsupported-version paths do not reach the v1 action. Assert the package's documented 404 for unmatched URL versions. Keep this probe out of production.
-- Force the second command of a test transaction to fail; disposal rolls back the first. Exercise cancellation while a query is active and show a later pooled operation still succeeds.
-- Run the migrator with invalid configuration/failing unapplied SQL; assert nonzero exit. Confirm the serving executable never runs migrations.
+- Force the second command of a test transaction to fail; disposal rolls back the first. Exercise cancellation while a query is active and show a later scoped context still succeeds.
+- Run the migrator with invalid configuration/a failing unapplied EF migration; assert nonzero exit. Confirm the serving executable never runs migrations.
+
+Also assert scoped context lifetime, no pending model changes, database constraints through SaveChanges, and safe baseline adoption/rejection.
 
 ## Done means
 
@@ -456,13 +479,13 @@ Build passes; migration repeatability, sanitized failure, rollback/cancellation,
 
 ## Already exists
 
-01 supplies two executables, embedded SQL, package locks, and valid SDK selection. Keep separate API and migrator images; use the existing two Dockerfiles as a starting point.
+01 supplies two executables, compiled EF migrations in their shared library, package locks, and valid SDK selection. Keep separate API and migrator images; use the existing two Dockerfiles as a starting point.
 
 ## Add and implement
 
-1. Use a .NET 10 SDK build stage to restore in locked mode and publish Release with --no-restore. Copy solution, SDK selection, project files, and lock files before sources for caching.
+1. Use a .NET 10 SDK build stage to restore in locked mode and publish Release with --no-restore. Copy solution, SDK selection, both executable project files, shared Persistence project, and their lock files before sources for caching.
 2. API final stage uses aspnet:10.0; migrator uses runtime:10.0. Run both as the image's unprivileged APP_UID. The API listens on 8080 through ASPNETCORE_HTTP_PORTS.
-3. SQL is embedded in the migrator DLL; no runtime script-folder copy or API migration command is required. Both images carry one release identifier.
+3. EF migrations are compiled into Kilo.Persistence.dll and published with the migrator and EF runtime assemblies; no script-folder copy or API migration command is required. Both images carry one release identifier.
 4. Keep secrets, .git, .idea, bin, obj, tmp, and output artifacts out of the Docker build context. Use .dockerignore. Build requires package restore access but no running database.
 5. Pin approved release base-image digests and build for the host CPU architecture. Preserve runtime CA certificates and globalization/timezone data needed for Clerk and IANA IDs.
 
@@ -491,7 +514,7 @@ Use the analogous project path, runtime base, and Kilo.Migrations.dll for the mi
 
 ## Gate
 
-- Build both images from a clean source checkout without bin/obj or a database. Verify embedded migration discovery in the migrator image.
+- Build both images from a clean source checkout without bin/obj or a database. Verify compiled EF migration discovery from Kilo.Persistence.dll inside the migrator image.
 - Run on the intended Linux architecture; inspect UID, listening port, and environment-only settings.
 - Scan layers/build context for secret files. Verify outbound trusted HTTPS works from the runtime used by the API.
 - Send SIGTERM during a real transactional write after that feature exists; require complete commit or rollback. For now verify host shutdown and container exit.
@@ -521,7 +544,7 @@ No Dockerfile-only unit tests. Verify the actual images.
 2. Use POSTGRES_DB=kilo, POSTGRES_USER, and a locally supplied password. The current POSTGRES_DATABASE setting is ineffective. For Postgres 18, mount the persistent volume at /var/lib/postgresql, matching its image layout [9].
 3. Use Host=db;Database=kilo in container connection strings. Inject credentials from ignored development configuration. Configure each executable separately.
 4. Put development port publishing in an override: API 127.0.0.1:8080:8080; publish DB to loopback only if Rider/native API tests need it. Production has neither direct API nor DB port publishing.
-5. Start the full stack; migrations are a fresh one-shot run when explicitly requested. Do not assume an old completed migration container ran scripts from a new image; deployment handles this in 18.
+5. Start the full stack; migrations are a fresh one-shot run when explicitly requested. Do not assume an old completed migration container applied migrations from a new image; deployment handles this in 18.
 
 ## Compose dependency shape - partial snippet
 
@@ -549,7 +572,7 @@ Container recreation is routine. Removing the named database volume is a data re
 
 - Start with a disposable empty volume; observe db healthy, migrations exits 0, then API becomes ready.
 - Create a users fixture through test SQL, recreate containers without deleting volumes, and assert it survives.
-- Make a new unapplied test migration fail. API startup is blocked; failure is visible. Repair only the unapplied script and rerun it freshly.
+- Make a new unapplied test migration fail. API startup is blocked; failure is visible. Repair only the unapplied fixture migration in the disposable source snapshot and run a fresh migrator. Assert failed DDL and its EF history entry rolled back; committed earlier history remains.
 - Confirm container Host=db networking and loopback-only development ports.
 - Inspect the base production Compose configuration: no published DB/API ports and no hardcoded development password.
 
@@ -570,14 +593,14 @@ No Compose-only unit suite. Store one reproducible startup/failure check with th
 
 ## Already exists
 
-01's users table already holds Clerk subject, timezone, and measurement preference. Reuse pooled connections, MVC validation, and v1 versioning. Health stays anonymous.
+01's users table already holds Clerk subject, timezone, and measurement preference. Reuse the scoped DbContext, MVC validation, and v1 versioning. Health stays anonymous.
 
 ## Add and implement
 
 1. Add Hosting/ClerkServiceCollectionExtensions.cs with AddKiloClerk(configuration). Bind ClerkOptions (Issuer, optional Audience, AuthorizedParties), validate HTTPS issuer and nonempty allowed origins with ValidateOnStart, and register JwtBearer. Do not fetch or parse JWTs yourself.
 2. Let the handler retrieve/cache trusted signing metadata and rotate keys. Set MapInboundClaims=false; verify issuer, lifetime, signing key, and intended algorithm. Validate audience when your Clerk token setup defines it. Require nonblank verified sub and allowed azp in OnTokenValidated [10]. No Clerk secret API key is needed just for signature verification.
 3. Register a fallback policy requiring authenticated users, and a named frontend CORS policy with explicit configured origins. CORS permission and token authorized-party validation are separate checks even if their configured origins match.
-4. Add Features/Me with CurrentUser, preferences requests/responses, SQL, and MeController. Resolve sub from the authenticated principal only. Use INSERT ... ON CONFLICT ... RETURNING id to provision once; cache the resolved ID inside the scoped resolver for that request.
+4. Add Features/Me with CurrentUser, preferences requests/responses, and MeController. Resolve sub from the authenticated principal only. Query Users by verified subject, add a User when absent, then SaveChangesAsync. On the named subject unique-key race, detach the failed Added entity and requery the winning row; do not swallow other DbUpdateException failures. Cache the resolved ID in the scoped resolver for that request.
 5. GET /me returns the local profile. PUT /me/preferences replaces both fields. Validate imperial/metric and an actual resolvable IANA timezone (UTC accepted); verify Linux runtime support. Never change stored workout weights on preference updates.
 
 ## Program.cs delta after the two existing registrations
@@ -593,7 +616,7 @@ app.UseAuthorization();
 
 The delta has two insertion points, not a block to paste at the bottom. Keep registration before Build and middleware before endpoint mapping. OpenAPI in development and /health must opt out with AllowAnonymous when the fallback policy is enabled.
 
-Routes: GET /api/v1/me; PUT /api/v1/me/preferences. New users default to UTC and imperial; client weight-input default is lb. No new SQL migration.
+Routes: GET /api/v1/me; PUT /api/v1/me/preferences. New users default to UTC and imperial; client weight-input default is lb. No new migration; use the existing User mapping.
 
 ---page---
 # Slice 04 - Verification and auth outage policy
@@ -627,31 +650,27 @@ Every feature receives local userId from CurrentUser, never from a request body.
 
 ## Already exists
 
-Authenticated local users, scoped CurrentUser, v1 controllers, pooled connections, and a real DB test harness. Add 002_exercises.sql from the migration reference.
+Authenticated local users, scoped CurrentUser, v1 controllers, scoped EF persistence, and a real DB test harness. Generate AddExercises from the migration reference.
 
 ## Add and implement
 
-1. Create Features/Exercises with ExerciseWriteRequest, ExerciseDto, ExerciseRepository, and ExercisesController. Register the concrete repository as scoped in a small feature registration extension once several feature registrations need grouping.
+1. Create Features/Exercises with ExerciseWriteRequest, ExerciseDto, and ExercisesController; add the Exercise entity and Fluent mapping to Persistence. Simple CRUD injects KiloDbContext directly. Group feature registrations only when there is real registration growth.
 2. Keep DTO validation with the request. Require a nonblank trimmed name; normalize optional description to empty string. Validate the trimmed brand in IValidatableObject (rather than applying a raw-string length attribute), then normalize omitted/null/blank brandName to null and limit a nonempty brand to 100 characters. PUT omission clears it.
-3. Use parameterized INSERT ... RETURNING and explicit projections/aliases. Every list/detail/update includes user_id=@userId. Do not map nested response objects directly through Dapper.
+3. Use LINQ with explicit user predicates, read-only DTO projections, tracked Add/updates, and SaveChangesAsync. EF retrieves generated IDs/defaults. Every list/detail/update filters by verified UserId. Project nested API objects explicitly; never return tracked entities directly.
 4. Implement list, detail, create, metadata replacement. Exclude archived rows by default; includeArchived is an explicit query option. Updates to an owned archived exercise return 409; absent/foreign IDs return 404. Archive itself arrives in 15.
 5. Use CreatedAtAction for 201 Location, passing version=1 and id. Verify it round-trips through real routing.
 
-## Repository operation shape - partial method body
+## Read operation - partial body using slice-05 types
 
 ```csharp
-await using var connection = await source.OpenConnectionAsync(ct);
-var command = new CommandDefinition(
-    """
-    SELECT id AS "Id", name AS "Name", description AS "Description",
-           brand_name AS "BrandName", archived_at AS "ArchivedAt"
-    FROM exercises WHERE id = @id AND user_id = @userId
-    """,
-    new { id, userId }, commandTimeout: 15, cancellationToken: ct);
-return await connection.QuerySingleOrDefaultAsync<ExerciseDto>(command);
+return await db.Exercises.AsNoTracking()
+    .Where(x => x.Id == id && x.UserId == userId)
+    .Select(x => new ExerciseDto(
+        x.Id, x.Name, x.Description, x.BrandName, x.ArchivedAt))
+    .SingleOrDefaultAsync(ct);
 ```
 
-This uses Dapper and Npgsql namespaces and the injected NpgsqlDataSource. Repeat a short native connection scope for simple operations; do not rebuild DapperDb. A later multi-command workflow owns one connection and transaction for its whole operation.
+Implement those entity/DTO types in 05. For mutations load the owned entity, validate state, change its properties, and SaveChangesAsync(ct). No repository forwarding layer or context per nested call.
 
 Routes: GET/POST /exercises; GET/PUT /exercises/{id}. Brand is optional free-form equipment text, not a separate catalog or foreign key.
 
@@ -673,7 +692,7 @@ Routes: GET/POST /exercises; GET/PUT /exercises/{id}. Brand is optional free-for
 
 ## Carry forward
 
-Keep the same SQL ownership predicate and input validation style in routines. Library metadata remains editable; sessions will later copy historical values instead of joining current descriptions/brands.
+Keep the same explicit LINQ ownership predicate and input validation style in routines. Library metadata remains editable; sessions will later copy historical values instead of joining current descriptions/brands.
 
 @progress 05
 
@@ -682,15 +701,15 @@ Keep the same SQL ownership predicate and input validation style in routines. Li
 
 ## Already exists
 
-Exercise feature patterns and user isolation. Add 003_routines.sql; keep the established startup and authentication code.
+Exercise feature patterns and user isolation. Generate AddRoutines; keep the established startup and authentication code.
 
 ## Add and implement
 
-1. Add Features/Routines with requests/responses, controller, and concrete SQL repository. Use named operations, not a generic repository shared with exercises.
+1. Add Features/Routines with requests/responses, controller, and Routine entity/mapping. Use direct scoped EF CRUD; extract a named workflow only when operations become transactional.
 2. Implement create, private list, detail, and metadata replacement. Require a nonblank trimmed name; description is optional and normalizes to empty string.
 3. Detail returns exercises=[] until 07 adds placements. Avoid querying a table that does not exist yet. When children arrive, extend the same detail assembler rather than duplicating the endpoint.
 4. Filter archived routines from default lists, allow includeArchived explicitly, and reject metadata edits of owned archived routines with 409. Foreign/missing routine is 404.
-5. Add its scoped registration alongside Exercises. One AddKiloFeatures extension can collect concrete feature registrations; grow it with each slice. No service-location or reflection scan is needed.
+5. Direct DbContext CRUD needs no additional DI registration. When a real workflow service appears, register it as scoped; group cohesive registrations only when useful. No service-location or reflection scan is needed.
 
 Routes: GET/POST /routines; GET/PUT /routines/{id}. Creating an empty routine is valid. It cannot start a workout until it contains active planned sets.
 
@@ -712,28 +731,32 @@ Routes: GET/POST /routines; GET/PUT /routines/{id}. Creating an empty routine is
 
 ## Already exists
 
-Owned exercises and routines. Add 004_routine_exercises.sql with composite owner foreign keys and an active-position unique index. Extend routine details to read ordered placements.
+Owned exercises and routines. Generate AddRoutineExercises with composite owner foreign keys and an active-position unique index. Extend routine details to read ordered placements.
 
 ## Add and implement
 
 1. Add POST/PUT nested placement actions to the routine feature. Use route name placementId instead of ambiguous exerciseId; the wire path shape stays compatible. Body exerciseId is the library exercise ID.
 2. Create distinct placement IDs, allowing the same library exercise more than once. Store position>0, placement-specific description, and defaultRestSeconds>=0. Existing placement exerciseId is immutable; replacement will archive and create a new placement.
-3. For each placement write, open a connection and ReadCommitted transaction. Lock the owned routine first, then the owned library exercise when attaching. Require both active. Nested update must prove placement.routine_id equals the route routineId and user_id equals the caller.
+3. For each placement write, begin an explicit EF ReadCommitted transaction. Lock the owned routine first, then the owned library exercise when attaching. Require both active. Nested update must prove Placement.RoutineId equals the route routineId and UserId equals the caller.
 4. Return current library exercise name/brand through the routine detail join; store no placement brand column. Sets remain [] until 08.
-5. Pass the same transaction and ct to every command. Translate only the named active-position unique constraint violation to 409; let unrelated database faults remain errors.
+5. Use the same scoped context, transaction, and token for every operation. Translate only DbUpdateException wrapping the named active-position unique violation to 409; unrelated database faults remain errors.
 
 ## Transaction shape - partial workflow
 
 ```csharp
-await using var connection = await source.OpenConnectionAsync(ct);
-await using var transaction = await connection.BeginTransactionAsync(ct);
-// Lock owned routine; then owned exercise; validate; insert placement.
-// Every command uses new CommandDefinition(sql, args, transaction,
-//     commandTimeout: 15, cancellationToken: ct).
+await using var transaction = await db.Database.BeginTransactionAsync(
+    IsolationLevel.ReadCommitted, ct);
+var routine = await db.Routines.FromSqlInterpolated($"""
+    SELECT * FROM public.routines
+    WHERE id = {routineId} AND user_id = {userId} FOR UPDATE
+    """).AsTracking().SingleOrDefaultAsync(ct);
+// Validate routine, then lock/validate exercise with the same pattern.
+// Add the owned placement only after those checks.
+await db.SaveChangesAsync(ct);
 await transaction.CommitAsync(ct);
 ```
 
-No inner repository call may open another connection for this workflow. Put transaction SQL in the owning concrete workflow/repository. When several methods actually share a lock operation, extract a small method accepting connection and transaction; do not introduce a generic unit-of-work framework.
+This partial workflow uses the slice-06 Routine mapping and System.Data isolation enum. FromSqlInterpolated parameterizes values; never concatenate client SQL. EF has no LINQ FOR UPDATE operator, so this bounded provider query is intentional. Do not nest another context inside the transaction. Extract a small concrete lock helper only when several real callers need it.
 
 Lock ordering starts here: routine parent before library exercise; all code that needs both follows this order. Exercise-only archive will lock just the exercise. Future session mutations use their own parent session lock.
 
@@ -764,14 +787,14 @@ Template child writes lock the routine parent. This makes reorder and archive at
 
 ## Already exists
 
-Owned ordered placements and the routine transaction convention. Add 005_routine_sets.sql; extend routine details with ordered sets. Introduce shared WeightDto when both templates and future results use it.
+Owned ordered placements and the routine transaction convention. Generate AddRoutineSets; extend routine details with ordered sets. Introduce shared WeightDto when both templates and future results use it.
 
 ## Add and implement
 
 1. Add POST/PUT sets under a route routineId/placementId. Prove the complete routine->placement->set chain, not only ownership of the final ID. Lock the routine before writing.
 2. Validate setType warmup/working, position>0, targetRepsMin>0, targetRepsMax>=min. Integer binding rejects fractional reps. Use DataAnnotations plus IValidatableObject for the range relationship.
 3. A weight is null or a complete {value,unit} object. Use required nullable decimal?/string input members with [Required] so an omitted value cannot silently become zero; response WeightDto contains decimal/string. Validate value>=0 and unit lb/kg. Reject JSON outside decimal range. No unit inference from a profile.
-4. Store value/unit as a nullable pair using separate SQL parameters; the DB check enforces both absent or both present. Store exact original decimal values. Use unconstrained numeric (no fixed-scale rounding), bounded at the API by decimal.
+4. Map value/unit as separate nullable entity properties; the DB check enforces both absent or both present. Store exact original decimal values. Use unconstrained numeric (no fixed-scale rounding), bounded at the API by decimal.
 5. Nullable restSeconds inherits the placement default; explicit zero means zero. Resolve this only when a session or extra set is created. Keep the template override nullable.
 
 ## Wire examples
@@ -787,7 +810,7 @@ Owned ordered placements and the routine transaction convention. Add 005_routine
 }
 ```
 
-Read via internal row fields such as TargetWeightValue and TargetWeightUnit, then assemble the nullable WeightDto. Dapper rows are flat; API responses are nested. SQL aliases keep mapping explicit.
+Map TargetWeightValue and TargetWeightUnit explicitly. Use HasColumnType("numeric") without fixed precision/scale, and named Fluent check constraints for the pair, valid units, and finite nonnegative values. Project to nullable WeightDto with an explicit conditional expression; the entity remains flat and the API response nested.
 
 ---page---
 # Slice 08 - Verify planned sets
@@ -816,21 +839,21 @@ Client input defaults follow measurementSystem; requests always send the chosen 
 
 ## Already exists
 
-Owned templates and profile timezone. Add 006_routine_schedule.sql with primary key (user_id,weekday) and owned routine foreign key.
+Owned templates and profile timezone. Generate AddRoutineSchedule with primary key (user_id,weekday) and owned routine foreign key.
 
 ## Add and implement
 
 1. Add Features/Schedule with GET /schedule and PUT/DELETE /schedule/{weekday}. Weekday is an integer 1-7, Monday=1 and Sunday=7.
-2. PUT verifies/locks the owned active routine, then INSERT ... ON CONFLICT (user_id,weekday) DO UPDATE inside the same transaction. One routine may occupy several days.
-3. DELETE clears only the authenticated user's selected weekday and is idempotent (204 even when already empty). Return assigned entries in weekday order, not seven fabricated rows.
-4. Calculate an intended user's local day from TimeProvider UTC plus their timezone. Do not use the server's local timezone. In .NET DayOfWeek, Sunday is zero; map it to ISO 7.
-5. Do not validate scheduledDate against a weekly assignment at session start. The schedule is a convenience, not a permission to train.
+2. PUT locks owned User then active Routine in one EF transaction. Find (UserId, Weekday), add/update, SaveChangesAsync, commit. This lock order serializes same-user assignments across routines. A routine may occupy several days.
+3. DELETE locks User and clears only their selected weekday; repeat returns 204. GET returns assigned entries ordered by weekday.
+4. Compute local day from TimeProvider UTC and the user's timezone. Map .NET Sunday=0 to ISO 7; never use server-local time.
+5. Starting a workout on any day is valid; schedule assignments do not restrict scheduledDate.
 
 ## Gate
 
 - Assign the original routines Wednesday-Sunday (3-7). Replace Wednesday twice; one row remains.
 - Assign Upper A to Monday and Wednesday; both exist. Clear Wednesday twice; Monday and other users stay unchanged.
-- Invalid weekday/binding returns 400 (or 404 if rejected by route constraint); settle the exact action contract in its HTTP test. Use {weekday:int} plus [Range(1,7)] for the documented 400.
+- Use {weekday:int} plus [Range(1,7)]: a bound invalid weekday returns 400; a noninteger route is 404. Verify both.
 - Foreign routine returns 404; owned archived routine returns 409. No schedule row is written.
 - Test UTC day boundaries for America/Phoenix and a DST-observing zone.
 
@@ -845,7 +868,7 @@ Owned templates and profile timezone. Add 006_routine_schedule.sql with primary 
 
 ## Already exists
 
-Complete templates and transactional SQL. Add 007_sessions.sql. Create Features/Sessions with SessionDto assembly and a concrete StartSession workflow. Do not add repositories that open connections inside that workflow.
+Complete templates and transactional EF workflows. Generate AddSessions and its three entities/mappings. Create Features/Sessions with SessionDto assembly and a concrete StartSession workflow. All operations use one scoped context and transaction.
 
 ## Add and implement
 
@@ -853,13 +876,13 @@ Complete templates and transactional SQL. Add 007_sessions.sql. Create Features/
 2. In a RepeatableRead transaction, look up (user_id,key). If present, compare original routineId and scheduledDate: same payload returns existing snapshot with 200; different payload returns 409. This replay remains valid even if the routine was subsequently archived.
 3. If new, require the owned active routine and at least one active planned set. Copy routine metadata, active ordered placements, current exercise names/brands, ordered targets, both weight columns, and resolved rest. Actual reps/weights/completion timestamps start null.
 4. Keep sourceRoutineExerciseId for placement matching; never substitute library exerciseId. Return 201 with session Location for a new snapshot. GET /sessions/{id} reads the snapshot only.
-5. Let errors escape to roll back all rows. Unique-key races require a fresh transaction/snapshot to resolve the persisted key. Bounded retry (for example, at most 3 attempts) applies only to the named start-key unique violation, serialization failure, or deadlock for this atomic workflow. Never retry arbitrary writes automatically.
+5. Let errors escape to roll back all rows. Unique-key races require a fresh transaction/snapshot to resolve the persisted key. Use a fresh context as well as a fresh transaction per retry, because rolled-back tracked objects are not reset automatically. Bounded retry (for example, at most 3 attempts) applies only to the named start-key unique violation, serialization failure, or deadlock for this atomic workflow. Never retry arbitrary writes automatically.
 
 ## Why RepeatableRead here
 
 Several SELECT/INSERT statements must see one committed template state, including concurrent brand edits. The routine parent lock convention alone does not serialize independent library metadata updates. RepeatableRead supplies a consistent snapshot; transaction conflicts restart the whole copy, not just the last statement [11].
 
-Copy expression for rest: COALESCE(routine_sets.rest_seconds, routine_exercises.default_rest_seconds). Copy weight value and unit without conversion. Workouts may start on any day; scheduledDate is optional contextual data.
+Project templates with AsNoTracking within the RepeatableRead transaction. Build a new tracked session graph and SaveChangesAsync; EF propagates generated parent keys to children. Rest resolves with set.RestSeconds ?? placement.DefaultRestSeconds. Copy weight value and unit without conversion. Workouts may start on any day; scheduledDate is optional contextual data.
 
 ---page---
 # Slice 10 - Verify snapshots and retries
@@ -889,7 +912,7 @@ Every later session mutation begins by SELECT ... FOR UPDATE on the owned workou
 
 ## Already exists
 
-007 already has result columns and session-state constraints. Reuse SessionDto assembly, explicit weight input, and the parent session transaction convention. No new migration.
+AddSessions already has result columns and session-state constraints. Reuse SessionDto assembly, explicit weight input, and the parent session transaction convention. No new migration.
 
 ## Add and implement
 
@@ -922,7 +945,7 @@ Every later session mutation begins by SELECT ... FOR UPDATE on the owned workou
 
 ## Already exists
 
-Performed sets, parent session locking, and state columns. Add 008_history_indexes.sql. Extend the sessions feature, not startup.
+Performed sets, parent session locking, and state columns. Generate AddHistoryIndexes. Extend the sessions feature, not startup.
 
 ## Add and implement
 
@@ -932,14 +955,21 @@ Performed sets, parent session locking, and state columns. Add 008_history_index
 4. GET /sessions uses keyset paging by started_at DESC,id DESC. Limit defaults to 20, valid range 1-100. Validate status and a versioned base64 cursor containing the last UTC instant and int ID. Treat cursor data as untrusted and parameterize it; no cursor signing is needed for private filtered reads.
 5. Apply user/status filters on every page and request limit+1 to determine nextCursor. Document paging over concurrent inserts; the cursor does not promise a frozen database-wide snapshot.
 
-## Keyset predicate - partial SQL fragment
+## Keyset predicate - partial LINQ using slice-10 entities
 
-```sql
-WHERE user_id = @userId
-  AND (started_at, id) < (@cursorStartedAt, @cursorId)
-ORDER BY started_at DESC, id DESC
-LIMIT @take;
+```csharp
+var query = db.WorkoutSessions.AsNoTracking()
+    .Where(x => x.UserId == userId);
+if (cursor is not null)
+    query = query.Where(x => x.StartedAt < cursor.StartedAt
+        || (x.StartedAt == cursor.StartedAt && x.Id < cursor.Id));
+var rows = await query.OrderByDescending(x => x.StartedAt)
+    .ThenByDescending(x => x.Id)
+    .Take(limit + 1).Select(x => new SessionSummaryDto(/* fields */))
+    .ToListAsync(ct);
 ```
+
+The projection constructor is intentionally partial. Add status filtering before paging and the actual DTO projection when implementing 12.
 
 For the first page omit the cursor predicate. Validate bounds and serialization precision so ties paginate correctly. A finalization after 14 also clears both timer fields; until then those fields do not exist.
 
@@ -953,7 +983,7 @@ For the first page omit the cursor predicate. Validate bounds and serialization 
 - Repeat each finalization and verify the original finishedAt. Switching final states and later mutations return 409.
 - Race result writes, complete, and abandon; one serialized valid outcome persists. No write lands after finalization.
 - Traverse several pages with tied startedAt values; no duplicates/omissions in a static fixture. Foreign history never appears.
-- Invalid limit, status, or cursor returns 400 with no SQL interpolation. Verify nextCursor=null on the last page.
+- Invalid limit, status, or cursor returns 400 with no untrusted SQL interpolation. Verify nextCursor=null on the last page.
 - Read 135.5 lb history after metadata/preferences change; snapshot targets, results, brands and units are intact.
 
 ## Acceptance
@@ -971,7 +1001,7 @@ Previous performance in 13 reads these snapshots. Timer in 14 adds a small mutat
 
 ## Already exists
 
-Completed sessions, snapshot DTOs, and the previous-completed index introduced with 008. No new table or stored previous-reps field.
+Completed sessions, snapshot DTOs, and the previous-completed index introduced with AddHistoryIndexes. No new table or stored previous-reps field.
 
 ## Add and implement
 
@@ -1003,7 +1033,7 @@ Completed sessions, snapshot DTOs, and the previous-completed index introduced w
 
 ## Already exists
 
-First-completion detection in 11, parent session locks, TimeProvider, and finalization in 12. Add 009_rest_timer.sql and extend SessionDto with serverNow/restTimer.
+First-completion detection in 11, parent session locks, TimeProvider, and finalization in 12. Generate AddRestTimer and extend SessionDto with serverNow/restTimer.
 
 ## Add and implement
 
@@ -1040,21 +1070,19 @@ Archive columns/indexes, owned parent locks, immutable snapshots, and full routi
 
 ## Add and implement
 
-1. Reorder takes exactly the active child IDs, once each. Lock routine parent and validate the complete owned list. Allocate temporary positive positions above the current maximum, then final 1..N positions in one transaction. Check int overflow before any update; reject safely rather than colliding.
+1. Reorder takes exactly the active child IDs, once each. Lock routine parent and validate the complete owned list. Allocate temporary positive positions above the current maximum, then SaveChangesAsync before assigning final 1..N positions and saving again, all inside one explicit transaction. Two saves avoid immediate unique-index collisions; rollback preserves the original order. Check int overflow before any update; reject safely rather than colliding.
 2. DELETE planned set/placement archives the source row. Do not physically delete source rows referenced by historical sessions. New starts exclude archived children; old active/completed sessions retain copied values.
 3. DELETE routine locks it, archives it, and clears schedule entries in one transaction. Same owned archive returns 204. Metadata changes/start/schedule writes reject the archived state.
 4. DELETE exercise locks its owned row. Reject with 409 if an unarchived placement in an unarchived routine uses it. Creation of a placement already locks that same exercise; keep routine-before-exercise ordering where both locks are needed.
 5. To replace a movement, archive old placement and create a new one. Library brand edits affect routine reads and future starts; they never update session snapshot rows.
 
-## Archive guard - partial SQL predicate
+## Archive guard - partial LINQ using slice-07 entities
 
-```sql
-SELECT EXISTS (
-  SELECT 1 FROM routine_exercises re
-  JOIN routines r ON r.id = re.routine_id AND r.user_id = re.user_id
-  WHERE re.exercise_id = @exerciseId AND re.user_id = @userId
-    AND re.archived_at IS NULL AND r.archived_at IS NULL
-);
+```csharp
+var used = await db.RoutineExercises.AnyAsync(x =>
+    x.ExerciseId == exerciseId && x.UserId == userId
+    && x.ArchivedAt == null && x.Routine.ArchivedAt == null
+    && x.Routine.UserId == userId, ct);
 ```
 
 Execute after taking the exercise lock. A standalone NOT EXISTS followed by an update can race a new placement. Keep errors before writes when possible; rollback any rejected multi-command operation.
@@ -1100,7 +1128,7 @@ Local images, Compose network/volumes, configuration validation, and a complete 
 
 - Bring up the production configuration and verify architecture/versions and persistent data.
 - Inspect permissions and tracked/build artifacts; verify secrets are absent from source/layers/logs.
-- Application role can perform actual CRUD/identity inserts but cannot create/alter/drop a test table. Migrator role can apply a new script and grants continue to work.
+- Application role can perform actual CRUD/identity inserts but cannot create/alter/drop a test table. Migrator role can apply a new EF migration and grants continue to work.
 - Invalid required configuration fails clearly without values. User timezone validation works in Linux.
 
 ## Acceptance
@@ -1158,8 +1186,8 @@ Production host, image pair, migrator role, migration journal, readiness and HTT
 
 ## Gate
 
-- Fresh install and seeded previous-release upgrade both follow the same script path.
-- A new unapplied script runs exactly once; a failing script blocks new activation and does not pretend earlier committed scripts rolled back.
+- Fresh install and seeded previous-release upgrade both follow the same EF migration path.
+- A new unapplied EF migration runs exactly once; a failing migration blocks activation and does not pretend earlier committed migrations rolled back.
 - Concurrent deploy attempts serialize. Verify interrupted deployment can be safely inspected and resumed.
 - Upgrade preserves ownership, placements, snapshots, brands, preferences, exact decimals and original units.
 - Rehearse compatible image rollback and incompatible-change restore. Never rewrite a journaled migration.
@@ -1247,18 +1275,15 @@ Run against the Linux host through HTTPS. Retain evidence before marking the app
 - Restore an off-host backup separately, then insert a new row. Verify identities, source relationships, units, preferences, brands, timers, grants and migration journal.
 - Rehearse failed new migration, serialized deployments, compatible rollback and incompatible-change recovery. Record the tested release digests.
 
-## Verification record for this revised guide
+## Current implementation and evidence
 
-This document separates planned acceptance checks from checks performed while authoring it. Regenerating the PDF does not execute the app, SQL migrations, Clerk integration, Docker deployment, or restore. Any recipe compilation or PDF/form checks actually performed are reported with the delivered artifact; all product gates remain work for their slices.
+The repository implements slices 01-03 with EF persistence and a separate MigrateAsync executable. The transition verification record and slice-02/03 records contain the actual build, real-Postgres, image, and Compose checks. PDF regeneration does not prove a feature gate passed.
 
-- Complete slice-one API and migrator recipes compiled in isolated scratch projects with .NET SDK 10.0.100 and the listed package pins: zero warnings and errors. The current workspace application was not changed or certified.
-- HTTP smoke checks passed: test-only v1 routing, unversioned/v2 404 ProblemDetails, bounded database-unavailable readiness 503, development OpenAPI, secret-free test logs, and missing-configuration failure for both executables.
-- PDF checks passed: 62 pages and bookmarks, 100 canonical progress fields and matching widgets, form appearances, save/reopen persistence, content bounds, and rendered-page inspection.
-- Real-Postgres migration/rollback checks, live Clerk integration, containers, host deployment and recovery were not executed during this document revision.
+Slices 04-20 remain planned work: Clerk, workout features, Linux deployment, and recovery are not implemented or certified. SQL contracts in the appendix describe future mappings; they do not authorize generating all future tables now.
 
-## Begin with 01
+## Continue with 04
 
-Correct SDK selection, compose startup through two service extensions, add native readiness, establish the users baseline/migrator, and pass the focused integration gate. Then proceed to images and Compose. No future feature registrations are needed to get the foundation running.
+Retain the scoped context, native migration history, slim startup, image pair, and Compose gate. Introduce verified Clerk identity and use the existing users table. No persistence rewrite or future feature scaffolding is needed.
 
 ---page---
 # API reference - route catalog
@@ -1359,7 +1384,7 @@ RestTimerRequest
   endsAt: required DateTimeOffset compatible with UTC storage
 ```
 
-Omitted/null actualWeight clears its recorded pair on replacement. An absent targetWeight means no planned weight. A valid zero needs value=0 and a unit. Normalize optional description/brand once before writing; reuse those normalized values for validation and SQL.
+Omitted/null actualWeight clears its recorded pair on replacement. An absent targetWeight means no planned weight. A valid zero needs value=0 and a unit. Normalize optional description/brand once before writing; reuse those values for validation and entity changes.
 
 ---page---
 # Contract reference - responses
@@ -1410,11 +1435,11 @@ Documentation checked while rebuilding this guide. Links support the framework m
 1. Microsoft: controller API behavior, model validation and ProblemDetails. https://learn.microsoft.com/en-us/aspnet/core/web-api/?view=aspnetcore-10.0
 2. .NET Foundation: current ASP.NET API Versioning project and package lineage. https://github.com/dotnet/aspnet-api-versioning
 3. API Versioning: URL segment route matching. https://dotnet.github.io/aspnet-api-versioning/aspnet-core/how-to/version-by-url.html
-4. Npgsql: data sources, pooling, disposal and transactions. https://www.npgsql.org/doc/basic-usage.html
-5. Dapper: query mapping, parameters and CommandDefinition. https://github.com/DapperLib/Dapper
+4. Npgsql: EF Core PostgreSQL provider. https://www.npgsql.org/efcore/
+5. Microsoft: efficient EF querying and projections. https://learn.microsoft.com/en-us/ef/core/performance/efficient-querying
 6. Microsoft: SDK selection with global.json. https://learn.microsoft.com/en-us/dotnet/core/tools/global-json
 7. Microsoft: native ASP.NET Core health checks. https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks?view=aspnetcore-10.0
-8. DbUp: transaction strategies. https://dbup.readthedocs.io/en/latest/more-info/transactions/
+8. Microsoft: managing and applying EF migrations. https://learn.microsoft.com/en-us/ef/core/managing-schemas/migrations/managing and https://learn.microsoft.com/en-us/ef/core/managing-schemas/migrations/applying
 9. Docker: official Postgres image configuration and version 18 volume layout. https://hub.docker.com/_/postgres
 10. Clerk: session-token verification and authorized parties. https://clerk.com/docs/guides/sessions/manual-jwt-verification
 11. PostgreSQL: transaction isolation. https://www.postgresql.org/docs/current/transaction-iso.html
@@ -1422,11 +1447,14 @@ Documentation checked while rebuilding this guide. Links support the framework m
 13. Microsoft: .NET 10 handled-exception diagnostic suppression. https://learn.microsoft.com/en-us/aspnet/core/breaking-changes/10/exception-handler-diagnostics-suppressed?view=aspnetcore-10.0
 14. NuGet: checked foundation versioning and OpenAPI packages. https://www.nuget.org/packages/Asp.Versioning.Mvc/10.2.1 and https://www.nuget.org/packages/Microsoft.AspNetCore.OpenApi/10.0.12
 
-The following SQL reference is split by first-use migration. Fresh installs execute that same sequence; it is not a separate baseline that should be run alongside the individual scripts. DB execution remains an implementation verification gate.
+15. Microsoft: EF transactions and savepoints. https://learn.microsoft.com/en-us/ef/core/saving/transactions
+16. Microsoft: scoped DbContext lifetime and configuration. https://learn.microsoft.com/en-us/ef/core/dbcontext-configuration/
+
+The following SQL is a schema contract for reviewed EF mappings and generated PostgreSQL output. It is not an executable script set. Configure explicit table/column names, identity ALWAYS, checks, defaults, filtered indexes, composite keys/FKs, and delete behavior in Fluent mappings. Use DeleteBehavior.Restrict for historical source references; do not inherit cascading deletion accidentally. Generate only the migration required by the current slice.
 
 
 ---page---
-# Migration reference - 001_users.sql / introduced in 01
+# Schema contract - CreateUsers / introduced in 01
 
 ```sql
 CREATE TABLE users (
@@ -1442,7 +1470,7 @@ CREATE TABLE users (
 
 
 ---page---
-# Migration reference - 002_exercises.sql / introduced in 05
+# Schema contract - AddExercises / introduced in 05
 
 ```sql
 CREATE TABLE exercises (
@@ -1464,7 +1492,7 @@ CREATE INDEX exercises_active_list
 
 
 ---page---
-# Migration reference - 003_routines.sql / introduced in 06
+# Schema contract - AddRoutines / introduced in 06
 
 ```sql
 CREATE TABLE routines (
@@ -1484,7 +1512,7 @@ CREATE INDEX routines_active_list
 
 
 ---page---
-# Migration reference - 004_routine_exercises.sql / introduced in 07
+# Schema contract - AddRoutineExercises / introduced in 07
 
 ```sql
 CREATE TABLE routine_exercises (
@@ -1510,7 +1538,7 @@ CREATE UNIQUE INDEX routine_exercises_active_position
 
 
 ---page---
-# Migration reference - 005_routine_sets.sql / introduced in 08
+# Schema contract - AddRoutineSets / introduced in 08
 
 ```sql
 CREATE TABLE routine_sets (
@@ -1539,7 +1567,7 @@ CREATE UNIQUE INDEX routine_sets_active_position
 
 
 ---page---
-# Migration reference - 006_routine_schedule.sql / introduced in 09
+# Schema contract - AddRoutineSchedule / introduced in 09
 
 ```sql
 CREATE TABLE routine_schedule (
@@ -1556,9 +1584,9 @@ CREATE INDEX routine_schedule_routine
 
 
 ---page---
-# Migration reference - 007_sessions.sql / part 1 / introduced in 10
+# Schema contract - AddSessions / part 1 / introduced in 10
 
-Combine parts 1-4 in this order in one embedded 007_sessions.sql. These page breaks are for reading, not separate migration files.
+Map all three session entities and constraints, then generate one AddSessions EF migration. These four pages describe one schema contract, not separate files to execute.
 
 ```sql
 CREATE TABLE workout_sessions (
@@ -1599,9 +1627,9 @@ CREATE TABLE workout_sessions (
 
 
 ---page---
-# Migration reference - 007_sessions.sql / part 2 / same script
+# Schema contract - AddSessions / part 2 / same EF migration
 
-Combine parts 1-4 in this order in one embedded 007_sessions.sql. These page breaks are for reading, not separate migration files.
+Map all three session entities and constraints, then generate one AddSessions EF migration. These four pages describe one schema contract, not separate files to execute.
 
 ```sql
 CREATE TABLE session_exercises (
@@ -1632,9 +1660,9 @@ CREATE TABLE session_exercises (
 
 
 ---page---
-# Migration reference - 007_sessions.sql / part 3 / same script
+# Schema contract - AddSessions / part 3 / same EF migration
 
-Combine parts 1-4 in this order in one embedded 007_sessions.sql. These page breaks are for reading, not separate migration files.
+Map all three session entities and constraints, then generate one AddSessions EF migration. These four pages describe one schema contract, not separate files to execute.
 
 ```sql
 CREATE TABLE session_sets (
@@ -1685,9 +1713,9 @@ CREATE TABLE session_sets (
 
 
 ---page---
-# Migration reference - 007_sessions.sql / part 4 / same script
+# Schema contract - AddSessions / part 4 / same EF migration
 
-Combine parts 1-4 in this order in one embedded 007_sessions.sql. These page breaks are for reading, not separate migration files.
+Map all three session entities and constraints, then generate one AddSessions EF migration. These four pages describe one schema contract, not separate files to execute.
 
 ```sql
 ALTER TABLE session_sets ADD CONSTRAINT session_sets_weight_requires_result
@@ -1696,11 +1724,11 @@ CREATE INDEX session_sets_session
     ON session_sets(session_id);
 ```
 
-Session targets/results and lifecycle exist in 10. Their endpoints arrive in 11-12. The extra check prevents a stored weight on an untouched set. No timer columns exist until 009.
+Session targets/results and lifecycle exist in 10. Their endpoints arrive in 11-12. The extra check prevents a stored weight on an untouched set. No timer columns exist until AddRestTimer.
 
 
 ---page---
-# Migration reference - 008_history_indexes.sql / introduced in 12
+# Schema contract - AddHistoryIndexes / introduced in 12
 
 ```sql
 CREATE INDEX workout_sessions_history
@@ -1717,7 +1745,7 @@ CREATE INDEX workout_sessions_previous_completed
 
 
 ---page---
-# Migration reference - 009_rest_timer.sql / introduced in 14
+# Schema contract - AddRestTimer / introduced in 14
 
 ```sql
 ALTER TABLE workout_sessions
@@ -1733,4 +1761,4 @@ ALTER TABLE workout_sessions
         REFERENCES session_sets(id, session_id, user_id);
 ```
 
-All these statements execute through the same ordered migration journal. Timer attribution must reference a set from the exact session and owner. Finalization must clear both fields.
+Configure these changes in the EF model, then generate AddRestTimer and review its operations. Timer attribution must reference a set from the exact session and owner. Finalization must clear both fields.

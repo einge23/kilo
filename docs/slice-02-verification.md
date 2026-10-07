@@ -1,18 +1,18 @@
 # Slice 02 verification
 
-Status: **Done** for the current Linux AMD64 Docker host. Verified October 6, 2026.
+Status: **Done** for the current Linux AMD64 Docker host. Reverified October 7, 2026 after the EF Core transition.
 
 ## Build and runtime gate
 
 ```powershell
-pwsh -NoProfile -File scripts/verify-images.ps1 -Release slice02 -Platform linux/amd64
+pwsh -NoProfile -File scripts/verify-images.ps1 -Release efcore-20261007-final -Platform linux/amd64
 ```
 
 The command completed successfully. It built both Release images with `--pull --no-cache`, locked NuGet restores, and a clean source snapshot. Neither build required a database or supplied database credentials. The runtime probe is a dependency-free helper outside the application solution and is mounted only into temporary verification containers; it is not included in either release image.
 
 | Acceptance | Evidence |
 | --- | --- |
-| 02.1 Clean image builds | Both Docker builds succeeded from source without local bin/obj. The migrator image contains one nonempty embedded SQL resource, `001_users.sql`. |
+| 02.1 Clean image builds | Both Docker builds succeeded from source without local bin/obj. The migrator image discovers one compiled EF migration, `CreateUsers`, in shared `Kilo.Persistence.dll`. Its EF runtime dependencies load successfully. |
 | 02.2 Target architecture | Both image metadata and running .NET processes reported Linux AMD64/X64. |
 | 02.3 Non-root runtime | Both configured and actual runtime UIDs were 1654. |
 | 02.4 HTTPS/globalization | Both final images completed a trusted HTTPS request to Microsoft Learn, loaded French numeric culture, and resolved America/New_York winter/summer offsets. |
@@ -20,16 +20,16 @@ The command completed successfully. It built both Release images with `--pull --
 
 The context audit excluded harmless `.env`, key, build-output, Git, editor, temporary, and output sentinels, including ones under the application directory. Every saved image layer was inspected for excluded secret/editor paths; image environment settings contained no connection strings or credentials. The API bound to port 8080 with environment-only configuration, returned native 503 readiness with an unavailable database, and returned 404 for production OpenAPI. The migration executable returned nonzero with the expected sanitized diagnostic when its connection string was absent.
 
-An additional isolated Compose run used the pinned release-image pair with a disposable Postgres volume. Postgres became healthy, the migrator exited successfully and journaled one script, then the API returned **200 Healthy**. All verification containers, the isolated Compose network/volume, and large scratch files were removed. Existing development containers and data were preserved.
+The separate [slice 03 gate](slice-03-verification.md) reverified fresh EF migration success, readiness, persistence, and failure/repair against disposable Compose resources. Existing development containers and data were preserved.
 
 ## Image identifiers
 
-Both images carry `org.opencontainers.image.version=slice02`.
+Both images carry `org.opencontainers.image.version=efcore-20261007-final`.
 
 | Local image tag | Verified local image ID |
 | --- | --- |
-| `kilo:slice02` | `sha256:9989be6ad7d9536a48b1efe64b441075783e7214b76ac669d195e7282152def0` |
-| `kilo-migrations:slice02` | `sha256:19775e665c6b43005130d0d2f89c3d55d8e6141a267ea7423b68b3cd0997b957` |
+| `kilo:efcore-20261007-final` | `sha256:02a011a1574945c2119600bc38a20f3214690fba73a78b5432c142ca97c1295b` |
+| `kilo-migrations:efcore-20261007-final` | `sha256:07fb0531adeee328b3b30cbd8229624cf9a923cafe232f0bbe09952bbf326427` |
 
 These are local build identifiers, not published registry references. A rebuild can produce different image IDs; record the outputs for each release and use a new release tag.
 
@@ -47,4 +47,4 @@ Review base-image security updates explicitly and rerun the gate after changing 
 
 ## Carry forward
 
-Transactional-write shutdown remains deferred until feature writes exist, as required by the workbook, and is rechecked in slice 20. This record does not mark slice 03's persistence/failure gates or later identity/features complete. The plan itself is unchanged; the canonical PDF remains the cumulative implementation guide.
+Transactional-write shutdown remains deferred until feature writes exist, as required by the workbook, and is rechecked in slice 20. This record does not mark slice 03's persistence/failure gates or later identity/features complete. The plan and canonical PDF now describe cumulative EF implementation. See the [transition record](ef-core-transition.md) for model/tooling checks and retained-volume adoption.

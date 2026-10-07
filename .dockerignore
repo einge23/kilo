@@ -6,6 +6,8 @@
 !Kilo/**
 !Kilo.Migrations/
 !Kilo.Migrations/**
+!Kilo.Persistence/
+!Kilo.Persistence/**
 **/bin
 **/obj
 **/.git

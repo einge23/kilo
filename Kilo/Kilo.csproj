@@ -9,8 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Asp.Versioning.Mvc" Version="10.2.1" />
-    <PackageReference Include="Dapper" Version="2.1.89" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
-    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <ProjectReference Include="../Kilo.Persistence/Kilo.Persistence.csproj" />
   </ItemGroup>
 </Project>

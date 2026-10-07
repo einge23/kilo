@@ -6,8 +6,10 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:e70cdb7f80b0348f5cb85f19a8f670fca0
 WORKDIR /src
 COPY global.json Kilo.slnx ./
 COPY Kilo.Migrations/Kilo.Migrations.csproj Kilo.Migrations/packages.lock.json Kilo.Migrations/
+COPY Kilo.Persistence/Kilo.Persistence.csproj Kilo.Persistence/packages.lock.json Kilo.Persistence/
 RUN dotnet restore Kilo.Migrations/Kilo.Migrations.csproj --locked-mode
 COPY Kilo.Migrations/ Kilo.Migrations/
+COPY Kilo.Persistence/ Kilo.Persistence/
 RUN dotnet publish Kilo.Migrations/Kilo.Migrations.csproj -c Release --no-restore -o /out /p:UseAppHost=false
 
 FROM base AS final

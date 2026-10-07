@@ -70,7 +70,8 @@ try {
     $files = & git -C $root ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate repository source.' }
     foreach ($file in $files) {
-        if ($file -notmatch '^(\.dockerignore|global\.json|Kilo\.slnx|compose(\.override)?\.yaml)$|^Kilo(\.Migrations)?/') { continue }
+        if ($file -notmatch '^(\.dockerignore|global\.json|Kilo\.slnx|compose(\.override)?\.yaml)$|^Kilo(\.Migrations|\.Persistence)?/') { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $root $file))) { continue }
         $destination = Join-Path $context $file
         New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $root $file) -Destination $destination
@@ -131,7 +132,7 @@ services:
     $fixtureId = Invoke-Sql "INSERT INTO users(clerk_user_id) VALUES ('$fixture') RETURNING id"
     $fixtureId = @($fixtureId | Where-Object { $_ -match '^\d+$' })[0]
     Assert-Check ([int] $fixtureId -gt 0) 'Users fixture was not created.'
-    $initialScripts = [int] (Invoke-Sql 'SELECT count(*) FROM schemaversions')
+    $initialScripts = [int] (Invoke-Sql 'SELECT count(*) FROM public."__EFMigrationsHistory"')
 
     Invoke-Compose down
     Invoke-Docker volume inspect $volume | Out-Null
@@ -141,15 +142,30 @@ services:
     Assert-Check ($recreatedDb.Id -ne $originalDb.Id) 'Database container was not recreated.'
     Assert-Check (($recreatedDb.Mounts | Where-Object Destination -eq '/var/lib/postgresql').Name -eq $volume) 'Database volume changed.'
     Assert-Check ((Invoke-Sql "SELECT id FROM users WHERE clerk_user_id = '$fixture'") -eq $fixtureId) 'Users fixture did not survive recreation.'
-    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM schemaversions') -eq $initialScripts) 'Applied migrations reran.'
+    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM public."__EFMigrationsHistory"') -eq $initialScripts) 'Applied migrations reran.'
     Write-Host 'Container recreation preserved the users fixture and migration journal.'
 
-    # This deliberately bad, unapplied script exists only in the disposable source snapshot.
+    # This deliberately bad EF migration exists only in the disposable source snapshot.
     $testTable = "compose_gate_$checkId"
-    $scriptName = "999999_compose_gate_$checkId.sql"
-    $testScript = Join-Path $context "Kilo.Migrations/Migrations/$scriptName"
+    $migrationId = "20991231235959_ComposeGate_$checkId"
+    $testMigration = Join-Path $context "Kilo.Persistence/Migrations/ComposeGate.cs"
     $repairSql = "CREATE TABLE $testTable (marker text PRIMARY KEY); INSERT INTO $testTable VALUES ('repaired');"
-    Set-Content -LiteralPath $testScript -Value "$repairSql SELECT 1 / 0;"
+    $migrationSource = @"
+using Kilo.Persistence;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+namespace Kilo.Persistence.Migrations;
+[DbContext(typeof(KiloDbContext))]
+[Migration("$migrationId")]
+public sealed class ComposeGate : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+        => migrationBuilder.Sql("__CHECK_SQL__");
+    protected override void Down(MigrationBuilder migrationBuilder)
+        => migrationBuilder.Sql("DROP TABLE $testTable;");
+}
+"@
+    Set-Content -LiteralPath $testMigration -Value $migrationSource.Replace('__CHECK_SQL__', "$repairSql SELECT 1 / 0;")
     Invoke-Docker build --platform $Platform --build-arg "RELEASE_VERSION=$project" `
         --file (Join-Path $context 'Kilo.Migrations/Dockerfile') --tag $migrationImage $context
     # Dependency gates apply to startup, so remove the running API before exercising failure.
@@ -163,23 +179,23 @@ services:
     $logs = Invoke-Compose logs --no-color migrations 2>&1
     Assert-Check (($logs -join "`n").Contains('Migration failed; release not activated.')) 'Migration failure diagnostic is missing.'
     Assert-Check ((Invoke-Sql "SELECT to_regclass('public.$testTable') IS NULL") -eq 't') 'Failed migration changes did not roll back.'
-    Assert-Check ([int] (Invoke-Sql "SELECT count(*) FROM schemaversions WHERE scriptname LIKE '%$scriptName'") -eq 0) 'Failed migration was journaled.'
+    Assert-Check ([int] (Invoke-Sql "SELECT count(*) FROM public.`"__EFMigrationsHistory`" WHERE `"MigrationId`" = '$migrationId'") -eq 0) 'Failed migration was journaled.'
     Assert-Check ((Invoke-Sql "SELECT id FROM users WHERE clerk_user_id = '$fixture'") -eq $fixtureId) 'Failed migration damaged existing data.'
-    Write-Host 'Failed migration exited nonzero, blocked API startup, and rolled back.'
+    Write-Host 'Failed EF migration exited nonzero, blocked API startup, and rolled back.'
 
-    Set-Content -LiteralPath $testScript -Value $repairSql
+    Set-Content -LiteralPath $testMigration -Value $migrationSource.Replace('__CHECK_SQL__', $repairSql)
     Invoke-Docker build --platform $Platform --build-arg "RELEASE_VERSION=$project" `
         --file (Join-Path $context 'Kilo.Migrations/Dockerfile') --tag $migrationImage $context
     Invoke-Compose rm --stop --force api migrations
     Invoke-Compose up -d --no-build
     Assert-Healthy
     Assert-Check ((Invoke-Sql "SELECT marker FROM $testTable") -eq 'repaired') 'Repaired migration was not applied.'
-    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM schemaversions') -eq ($initialScripts + 1)) 'Repaired migration journal is incorrect.'
+    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM public."__EFMigrationsHistory"') -eq ($initialScripts + 1)) 'Repaired migration journal is incorrect.'
     Assert-Check ((Invoke-Sql "SELECT id FROM users WHERE clerk_user_id = '$fixture'") -eq $fixtureId) 'Repair damaged existing data.'
     Invoke-Compose rm --stop --force api migrations
     Invoke-Compose up -d --no-build
     Assert-Healthy
-    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM schemaversions') -eq ($initialScripts + 1)) 'Successful migration reran.'
+    Assert-Check ([int] (Invoke-Sql 'SELECT count(*) FROM public."__EFMigrationsHistory"') -eq ($initialScripts + 1)) 'Successful migration reran.'
     Write-Host 'Repair and a fresh repeat migration succeeded without data loss or duplicate journal entries.'
 
     [pscustomobject]@{
@@ -189,7 +205,7 @@ services:
         HostDbNetworking = $true
         DataSurvivesRecreation = $true
         MigrationFailureBlocksApi = $true
-        FailedScriptRollsBack = $true
+        FailedMigrationRollsBack = $true
         RepairAndRepeatSucceed = $true
         DevelopmentPortsAreLoopback = $true
         BasePublishesNoPorts = $true

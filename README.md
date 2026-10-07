@@ -1,6 +1,6 @@
 # Kilo
 
-The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, pooled Postgres, readiness, and a separate SQL migrator. Clerk and business endpoints arrive in later slices.
+The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, and a separate EF migrator. Clerk and business endpoints arrive in later slices. The [EF transition record](docs/ef-core-transition.md) summarizes the completed checks and retained-volume adoption path.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
 
@@ -13,7 +13,7 @@ docker build --pull --platform linux/amd64 --build-arg RELEASE_VERSION=slice02 -
 docker build --pull --platform linux/amd64 --build-arg RELEASE_VERSION=slice02 -f Kilo.Migrations/Dockerfile -t kilo-migrations:slice02 .
 ```
 
-Use a new immutable tag for each release; the default `development` label is for local Compose builds. The API listens on 8080. SQL is embedded in the migrator, and neither build requires a database or credentials. The build-context allowlist excludes the PDF, docs, tests, scripts, local secrets, editor state, and build artifacts.
+Use a new immutable tag for each release; the default `development` label is for local Compose builds. The API listens on 8080. EF migrations are compiled into shared `Kilo.Persistence.dll` and published with the migrator, and neither build requires a database or credentials. The build-context allowlist excludes the PDF, docs, tests, scripts, local secrets, editor state, and build artifacts.
 
 Run the actual-image gate with Docker Desktop in Linux mode, PowerShell 7, and Git on PATH:
 
@@ -21,7 +21,7 @@ Run the actual-image gate with Docker Desktop in Linux mode, PowerShell 7, and G
 pwsh -NoProfile -File scripts/verify-images.ps1 -Release slice02 -Platform linux/amd64
 ```
 
-The gate builds from a clean source snapshot without the Docker build cache, exercises context exclusions with harmless sentinels, scans image layers, and verifies non-root execution, shared release labels, environment-only startup, production OpenAPI exclusion, embedded SQL, trusted HTTPS, ICU/IANA timezone data, and clean SIGTERM shutdown. It leaves the tagged images and records their local image IDs in ignored `.artifacts/image-check-*/images.json`; temporary containers are removed. Transactional shutdown is checked again once feature writes exist. Use `linux/arm64` only when that is the intended target; an emulated run does not prove performance on an ARM host.
+The gate builds from a clean source snapshot without the Docker build cache, exercises context exclusions with harmless sentinels, scans image layers, and verifies non-root execution, shared release labels, environment-only startup, production OpenAPI exclusion, compiled EF migrations, trusted HTTPS, ICU/IANA timezone data, and clean SIGTERM shutdown. It leaves the tagged images and records their local image IDs in ignored `.artifacts/image-check-*/images.json`; temporary containers are removed. Transactional shutdown is checked again once feature writes exist. Use `linux/arm64` only when that is the intended target; an emulated run does not prove performance on an ARM host.
 
 The [slice 02 verification record](docs/slice-02-verification.md) records the completed gate, base digests, and tested image IDs.
 
@@ -38,7 +38,7 @@ Invoke-WebRequest http://127.0.0.1:8080/health
 
 Compose waits for Postgres, runs the migrator once, then starts the API. The development override exposes API 8080 and Postgres 5432 on loopback. The base `compose.yaml` publishes no ports; production roles, TLS, and deployment are later slices. `/openapi/v1.json` is available in Development. No business controller is deployed yet.
 
-An existing Postgres volume keeps its existing database names/passwords. Match its credentials rather than deleting the volume. New SQL scripts are additive; never edit an already-applied migration. For a new release, run its migrator freshly rather than relying on a previous container's success.
+An existing Postgres volume keeps its existing database names/passwords. Match its credentials rather than deleting the volume. New EF migrations are additive; never edit an already-applied migration. For a new release, run its migrator freshly rather than relying on a previous container's success.
 
 For a local code/schema update, stop the API and remove the completed migration container before starting the rebuilt stack:
 
@@ -84,6 +84,45 @@ Compose uses password authentication with `GSS Encryption Mode=Disable` to avoid
 dotnet test Kilo.slnx --no-restore
 ```
 
-Configuration, native HTTP/versioning/validation, pool lifetime, and unavailable-readiness checks run without a database. The Postgres check reports **Skipped** until `KILO_TEST_POSTGRES` supplies an admin connection with CREATE DATABASE permission. It creates and drops its own uniquely named test database; it never migrates the supplied admin database. With that variable set, it verifies migrations twice, identity/defaults, transactional rollback, cancellation, and healthy readiness.
+Configuration, native HTTP/versioning/validation, scoped context lifetime and model-snapshot consistency, and unavailable-readiness checks run without a database. The Postgres checks report **Skipped** until `KILO_TEST_POSTGRES` supplies an admin connection with CREATE DATABASE permission. It creates and drops its own uniquely named test databases; it never migrates the supplied admin database. With that variable set, it verifies migrations twice, identity/defaults, transactional rollback, cancellation, healthy readiness, database constraint enforcement, and explicit legacy adoption/preservation/drift rejection.
+
+## EF migration development
+
+`Kilo.Persistence` owns the entities, Fluent schema mapping, generated migrations, and model snapshot. Both executables reference it. Use native EF LINQ/DTO projections for reads and tracked changes with `SaveChangesAsync` for writes; no repository or connection wrapper is needed.
+
+The private Design reference and local tool manifest pin EF tooling to 10.0.12; the Npgsql EF provider is 10.0.3. The design-time factory requires environment `ConnectionStrings__Postgres` and does not inherit executable user secrets. Supply that setting securely for an available local database, then:
+
+```powershell
+dotnet tool restore
+# After changing the model for a requested slice:
+dotnet ef migrations add <DescriptiveName> --project Kilo.Persistence
+dotnet ef migrations has-pending-model-changes --project Kilo.Persistence
+dotnet ef migrations script --idempotent --project Kilo.Persistence
+dotnet run --project Kilo.Migrations
+```
+
+Review generated operations and SQL, then commit the migration, designer, and snapshot together. CreateUsers is already present; do not regenerate it or generate future slice entities early. Never use EnsureCreated, automatically migrate the API, or alter an applied migration. A failed migration does not undo earlier committed migrations ([EF migration guidance](https://learn.microsoft.com/en-us/ef/core/managing-schemas/migrations/applying)).
+
+## One-time adoption of an existing pre-EF volume
+
+The retained local stack still uses its earlier users baseline. Its volume has been preserved; this code change does not upgrade a running stack automatically. An ordinary EF migrator intentionally fails against that unadopted schema.
+
+Back up before adoption. With the existing stack running and configured from your local `.env`, create a logical backup without redirecting native binary output through PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force .artifacts/backups | Out-Null
+docker compose exec -T db pg_dump -U postgres -d kilo -Fc -f /tmp/kilo-before-ef.dump
+docker compose exec -T db pg_restore --list /tmp/kilo-before-ef.dump
+$dbContainer = docker compose ps -q db
+docker cp "${dbContainer}:/tmp/kilo-before-ef.dump" .artifacts/backups/kilo-before-ef.dump
+docker compose stop api
+docker compose build api migrations
+docker compose run --rm migrations --adopt-legacy-baseline
+# Proceed only if the preceding command exits 0:
+docker compose rm --stop --force migrations
+docker compose up -d
+```
+
+Use the existing configured database/role names if different. Inventory `public.users` and `public.schemaversions` before running the flag. The bridge requires the exact known five-column users model, named constraints/defaults/identity, a single known legacy script entry, no other application tables/triggers, and no applied EF migrations. It audits and writes the native CreateUsers history row transactionally while locking users; it preserves rows, IDs, identity sequence state, and the legacy journal as historical metadata. Future migrations then apply normally. Schema drift returns a sanitized failure: leave the API stopped, inspect the difference, and design a specific migration. Do not fake journal entries, rerun the flag after adoption, or remove volumes. Use ordinary migration runs thereafter. Tests exercise adoption against disposable legacy databases; the existing local volume was not changed.
 
 The API never migrates on startup. The migrator returns nonzero with a sanitized diagnostic on failure. Health uses the native `Healthy`/`Unhealthy` response with 200/503; HTTP errors use ProblemDetails and standard MVC validation returns 400.

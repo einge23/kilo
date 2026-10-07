@@ -3,7 +3,8 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using Asp.Versioning;
-using Dapper;
+using Kilo.Persistence;
+using Microsoft.EntityFrameworkCore;
 using Kilo.Hosting;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
@@ -34,12 +35,16 @@ public sealed class FoundationTests
     }
 
     [Fact]
-    public async Task Host_has_one_pool_and_only_test_routes_are_versioned()
+    public async Task Host_has_scoped_contexts_and_only_test_routes_are_versioned()
     {
         await using var factory = CreateApi(UnavailableDatabase);
         using var client = factory.CreateClient();
-        var pool = factory.Services.GetRequiredService<NpgsqlDataSource>();
-        Assert.Same(pool, factory.Services.GetRequiredService<NpgsqlDataSource>());
+        using var firstScope = factory.Services.CreateScope();
+        using var secondScope = factory.Services.CreateScope();
+        var db = firstScope.ServiceProvider.GetRequiredService<KiloDbContext>();
+        Assert.Same(db, firstScope.ServiceProvider.GetRequiredService<KiloDbContext>());
+        Assert.NotSame(db, secondScope.ServiceProvider.GetRequiredService<KiloDbContext>());
+        Assert.False(db.Database.HasPendingModelChanges());
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/v1/probe")).StatusCode);
         foreach (var route in new[] { "/api/probe", "/api/v2/probe" })
         {
@@ -76,74 +81,131 @@ public sealed class FoundationTests
     }
 
     [PostgresFact]
-    public async Task Migrations_repeat_and_native_transactions_roll_back_failures_and_cancellation()
+    public async Task Ef_migrations_repeat_and_transactions_roll_back_failures_and_cancellation()
     {
-        var adminSettings = new NpgsqlConnectionStringBuilder(
-            Environment.GetEnvironmentVariable("KILO_TEST_POSTGRES"));
-        // This generated identifier belongs only to this test; never reuse a user's database.
-        var database = "kilo_test_" + Guid.NewGuid().ToString("N");
-        await using var admin = new NpgsqlConnection(adminSettings.ConnectionString);
-        await admin.OpenAsync();
-        await admin.ExecuteAsync($"CREATE DATABASE {database}");
-        try
+        await WithDatabase(async connectionString =>
         {
-            var settings = new NpgsqlConnectionStringBuilder(adminSettings.ConnectionString)
-                { Database = database };
-            var connectionString = settings.ConnectionString;
             var first = await RunMigrator(connectionString);
             Assert.True(first.ExitCode == 0, first.Output);
-            await using var source = NpgsqlDataSource.Create(connectionString);
-            await using (var connection = await source.OpenConnectionAsync())
-            {
-                var id = await connection.QuerySingleAsync<int>("""
-                    INSERT INTO users(clerk_user_id) VALUES ('fixture') RETURNING id
-                    """);
-                Assert.True(id > 0);
-                Assert.Equal("imperial", await connection.QuerySingleAsync<string>(
-                    "SELECT measurement_system FROM users WHERE id = @id", new { id }));
-                var scripts = await connection.QuerySingleAsync<int>("SELECT count(*)::int FROM schemaversions");
-                Assert.Equal(1, scripts);
-                var second = await RunMigrator(connectionString);
-                Assert.True(second.ExitCode == 0, second.Output);
-                Assert.Equal(id, await connection.QuerySingleAsync<int>(
-                    "SELECT id FROM users WHERE clerk_user_id = 'fixture'"));
-                Assert.Equal(scripts, await connection.QuerySingleAsync<int>(
-                    "SELECT count(*)::int FROM schemaversions"));
+            await using var db = CreateContext(connectionString);
+            Assert.False(db.Database.HasPendingModelChanges());
+            var fixture = new User { ClerkUserId = "fixture" };
+            db.Users.Add(fixture);
+            await db.SaveChangesAsync();
+            Assert.True(fixture.Id > 0);
+            Assert.Equal("UTC", fixture.TimeZone);
+            Assert.Equal("imperial", fixture.MeasurementSystem);
+            Assert.Equal(DateTimeKind.Utc, fixture.CreatedAt.Kind);
+            var migrations = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
+            Assert.Single(migrations);
+            var second = await RunMigrator(connectionString);
+            Assert.True(second.ExitCode == 0, second.Output);
+            Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
+            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
 
-                await using (var transaction = await connection.BeginTransactionAsync())
-                {
-                    await connection.ExecuteAsync(new CommandDefinition(
-                        "INSERT INTO users(clerk_user_id) VALUES ('rollback')", transaction: transaction));
-                    await Assert.ThrowsAsync<PostgresException>(() => connection.ExecuteAsync(
-                        new CommandDefinition("SELECT 1 / 0", transaction: transaction)));
-                }
-                Assert.Equal(0, await connection.QuerySingleAsync<int>(
-                    "SELECT count(*)::int FROM users WHERE clerk_user_id = 'rollback'"));
+            await using (var write = CreateContext(connectionString))
+            await using (var transaction = await write.Database.BeginTransactionAsync())
+            {
+                write.Users.Add(new User { ClerkUserId = "rollback" });
+                await write.SaveChangesAsync();
+                await Assert.ThrowsAsync<PostgresException>(() =>
+                    write.Database.ExecuteSqlRawAsync("SELECT 1 / 0"));
             }
+            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "rollback"));
 
-            await using (var connection = await source.OpenConnectionAsync())
-            await using (var transaction = await connection.BeginTransactionAsync())
+            await using (var write = CreateContext(connectionString))
+            await using (var transaction = await write.Database.BeginTransactionAsync())
             {
-                await connection.ExecuteAsync(new CommandDefinition(
-                    "INSERT INTO users(clerk_user_id) VALUES ('cancelled')", transaction: transaction));
+                write.Users.Add(new User { ClerkUserId = "cancelled" });
+                await write.SaveChangesAsync();
                 using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => connection.ExecuteAsync(
-                    new CommandDefinition("SELECT pg_sleep(10)", transaction: transaction,
-                        commandTimeout: 15, cancellationToken: deadline.Token)));
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                    write.Database.ExecuteSqlRawAsync("SELECT pg_sleep(10)", deadline.Token));
             }
-            await using (var connection = await source.OpenConnectionAsync())
-                Assert.Equal(0, await connection.QuerySingleAsync<int>(
-                    "SELECT count(*)::int FROM users WHERE clerk_user_id = 'cancelled'"));
-
+            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "cancelled"));
+            await using (var invalid = CreateContext(connectionString))
+            {
+                invalid.Users.Add(new User { ClerkUserId = "invalid", MeasurementSystem = "unknown" });
+                await Assert.ThrowsAsync<DbUpdateException>(() => invalid.SaveChangesAsync());
+            }
+            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "invalid"));
             await using var factory = CreateApi(connectionString);
             using var client = factory.CreateClient();
             Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/health")).StatusCode);
+        });
+    }
+
+    [PostgresFact]
+    public async Task Explicit_legacy_adoption_preserves_rows_and_rejects_schema_drift()
+    {
+        await WithDatabase(async connectionString =>
+        {
+            await using var db = CreateContext(connectionString);
+            await db.Database.ExecuteSqlRawAsync(LegacyBaseline);
+            var fixture = new User { ClerkUserId = "retained" };
+            db.Users.Add(fixture);
+            await db.SaveChangesAsync();
+            var normal = await RunMigrator(connectionString);
+            Assert.NotEqual(0, normal.ExitCode); // Never silently adopts an unrecognized existing table.
+            var adopted = await RunMigrator(connectionString, "--adopt-legacy-baseline");
+            Assert.True(adopted.ExitCode == 0, adopted.Output);
+            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
+            Assert.Single(await db.Database.GetAppliedMigrationsAsync());
+            Assert.Equal(0, (await RunMigrator(connectionString)).ExitCode);
+            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
+        });
+        await WithDatabase(async connectionString =>
+        {
+            await using var db = CreateContext(connectionString);
+            await db.Database.ExecuteSqlRawAsync(LegacyBaseline);
+            await db.Database.ExecuteSqlRawAsync("ALTER TABLE users ALTER COLUMN time_zone SET DEFAULT 'GMT'");
+            db.Users.Add(new User { ClerkUserId = "preserve-on-rejection" });
+            await db.SaveChangesAsync();
+            var rejected = await RunMigrator(connectionString, "--adopt-legacy-baseline");
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.Empty(await db.Database.GetAppliedMigrationsAsync());
+            Assert.Single(await db.Users.AsNoTracking().ToListAsync());
+        });
+    }
+
+    private static KiloDbContext CreateContext(string connectionString) => new(
+        new DbContextOptionsBuilder<KiloDbContext>().UseNpgsql(connectionString,
+            postgres => postgres.CommandTimeout(15).MigrationsHistoryTable("__EFMigrationsHistory", "public")).Options);
+
+    private static async Task WithDatabase(Func<string, Task> check)
+    {
+        var adminSettings = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("KILO_TEST_POSTGRES"));
+        var database = "kilo_test_" + Guid.NewGuid().ToString("N");
+        await using var admin = new NpgsqlConnection(adminSettings.ConnectionString);
+        await admin.OpenAsync();
+        await using (var command = new NpgsqlCommand($"CREATE DATABASE {database}", admin) { CommandTimeout = 15 })
+            await command.ExecuteNonQueryAsync();
+        try
+        {
+            var settings = new NpgsqlConnectionStringBuilder(adminSettings.ConnectionString) { Database = database };
+            await check(settings.ConnectionString);
         }
         finally
         {
-            await admin.ExecuteAsync($"DROP DATABASE {database} WITH (FORCE)");
+            await using var command = new NpgsqlCommand($"DROP DATABASE {database} WITH (FORCE)", admin) { CommandTimeout = 15 };
+            await command.ExecuteNonQueryAsync();
         }
     }
+
+    // A historical test fixture only; production schema changes are EF migrations.
+    private const string LegacyBaseline = """
+        CREATE TABLE users (
+          id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          clerk_user_id text NOT NULL UNIQUE,
+          time_zone text NOT NULL DEFAULT 'UTC',
+          measurement_system text NOT NULL DEFAULT 'imperial'
+            CHECK (measurement_system IN ('imperial', 'metric')),
+          created_at timestamptz NOT NULL DEFAULT now(),
+          CHECK (btrim(clerk_user_id) <> '')
+        );
+        CREATE TABLE schemaversions (scriptname text NOT NULL);
+        INSERT INTO schemaversions VALUES ('Kilo.Migrations.Migrations.001_users.sql');
+        """;
 
     private static WebApplicationFactory<Program> CreateApi(string connectionString) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
@@ -154,7 +216,7 @@ public sealed class FoundationTests
                 services.AddControllers().AddApplicationPart(typeof(ProbeController).Assembly));
         });
 
-    private static async Task<(int ExitCode, string Output)> RunMigrator(string connectionString)
+    private static async Task<(int ExitCode, string Output)> RunMigrator(string connectionString, params string[] arguments)
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root is not null && !File.Exists(Path.Combine(root.FullName, "Kilo.slnx")))
@@ -171,6 +233,7 @@ public sealed class FoundationTests
             CreateNoWindow = true
         };
         start.ArgumentList.Add(assembly);
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
         start.Environment["DOTNET_ENVIRONMENT"] = "Production";
         start.Environment["ConnectionStrings__Postgres"] = connectionString;
         using var process = Process.Start(start)!;

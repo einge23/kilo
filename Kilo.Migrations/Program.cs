@@ -1,11 +1,15 @@
-using DbUp;
+using Kilo.Migrations;
+using Kilo.Persistence;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
-var builder = Host.CreateApplicationBuilder(args);
-var connectionString = builder.Configuration
-    .GetConnectionString("Postgres");
-if (string.IsNullOrWhiteSpace(connectionString))
+var adopt = args.Contains("--adopt-legacy-baseline", StringComparer.Ordinal);
+var builder = Host.CreateApplicationBuilder(args.Where(arg => arg != "--adopt-legacy-baseline").ToArray());
+builder.Logging.ClearProviders();
+if (string.IsNullOrWhiteSpace(builder.Configuration.GetConnectionString("Postgres")))
 {
     Console.Error.WriteLine("ConnectionStrings:Postgres is required.");
     return 1;
@@ -13,21 +17,23 @@ if (string.IsNullOrWhiteSpace(connectionString))
 
 try
 {
-    var upgrader = DeployChanges.To
-        .PostgresqlDatabase(connectionString)
-        .WithScriptsEmbeddedInAssembly(typeof(Program).Assembly)
-        .WithTransactionPerScript()
-        .Build();
-    var result = upgrader.PerformUpgrade();
-    if (!result.Successful)
+    builder.Services.AddKiloDatabase(builder.Configuration);
+    using var host = builder.Build();
+    await host.StartAsync();
+    try
     {
-        Console.Error.WriteLine("Migration failed; release not activated.");
-        return 1;
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
+        var ct = host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping;
+        if (adopt)
+            await LegacyBaselineAdoption.AdoptAsync(db, ct);
+        await db.Database.MigrateAsync(ct);
     }
+    finally { await host.StopAsync(); }
 }
 catch (Exception)
 {
-    Console.Error.WriteLine("Migrator failed; check protected diagnostics.");
+    Console.Error.WriteLine("Migration failed; release not activated.");
     return 1;
 }
 

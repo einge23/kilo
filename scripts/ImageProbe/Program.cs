@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Reflection;
 using System.Runtime.InteropServices;
 
 var expectedArchitecture = args[0] == "linux/amd64" ? Architecture.X64 : Architecture.Arm64;
@@ -22,18 +21,20 @@ response.EnsureSuccessStatusCode();
 
 if (File.Exists("/app/Kilo.Migrations.dll"))
 {
-    var assembly = Assembly.LoadFile("/app/Kilo.Migrations.dll");
-    var scripts = assembly.GetManifestResourceNames()
-        .Where(name => name.EndsWith(".sql", StringComparison.Ordinal)).ToArray();
-    if (!scripts.Any(name => name.EndsWith(".001_users.sql", StringComparison.Ordinal)))
-        throw new InvalidOperationException("Embedded users migration is missing.");
-    foreach (var script in scripts)
+    System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (context, name) =>
     {
-        using var reader = new StreamReader(assembly.GetManifestResourceStream(script)!);
-        if (string.IsNullOrWhiteSpace(await reader.ReadToEndAsync()))
-            throw new InvalidOperationException($"Empty embedded migration: {script}");
-    }
-    Console.WriteLine($"Embedded migrations: {scripts.Length}");
+        var path = Path.Combine("/app", name.Name + ".dll");
+        return File.Exists(path) ? context.LoadFromAssemblyPath(path) : null;
+    };
+    var assembly = System.Runtime.Loader.AssemblyLoadContext.Default
+        .LoadFromAssemblyPath("/app/Kilo.Persistence.dll");
+    var migrations = assembly.GetTypes().SelectMany(type => type.CustomAttributes)
+        .Where(attribute => attribute.AttributeType.FullName ==
+            "Microsoft.EntityFrameworkCore.Migrations.MigrationAttribute")
+        .Select(attribute => (string)attribute.ConstructorArguments[0].Value!).ToArray();
+    if (!migrations.Any(id => id.EndsWith("_CreateUsers", StringComparison.Ordinal)))
+        throw new InvalidOperationException("Compiled EF users migration is missing.");
+    Console.WriteLine($"Compiled EF migrations: {migrations.Length}");
 }
 
 Console.WriteLine("Runtime platform, trusted HTTPS, ICU, and IANA timezones passed.");

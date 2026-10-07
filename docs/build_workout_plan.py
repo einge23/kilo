@@ -105,7 +105,7 @@ def chrome(canvas, doc):
     canvas.setFillColor(GRAY)
     canvas.drawString(54, 763, 'KILO / .NET 10 / CUMULATIVE IMPLEMENTATION')
     canvas.setFont('Helvetica', 8)
-    canvas.drawString(54, 31, 'REVISED OCTOBER 6, 2026   /   BUILD -> VERIFY -> RECORD')
+    canvas.drawString(54, 31, 'REVISED OCTOBER 7, 2026   /   BUILD -> VERIFY -> RECORD')
     canvas.drawRightString(558, 31, str(doc.page))
     canvas.restoreState()
 
@@ -181,11 +181,14 @@ def main():
         title='Kilo - Cumulative .NET 10 Implementation Workbook',
         author='Kilo project', subject='20 slices with cumulative implementation notes')
     document.section_pages = []
-    document.build(parse(SOURCE.read_text(encoding='utf-8')), onFirstPage=chrome, onLaterPages=chrome)
+    story = parse(SOURCE.read_text(encoding='utf-8'))
+    expected_sections = sum(isinstance(item, Paragraph) and item.style.name == 'PlanTitle'
+                            for item in story)
+    document.build(story, onFirstPage=chrome, onLaterPages=chrome)
     reader = PdfReader(OUTPUT)
     fields = reader.get_fields()
     assert len(fields) == 100, f'Expected 100 progress fields, got {len(fields)}'
-    assert len(document.section_pages) == SOURCE.read_text(encoding='utf-8').count('\n# ') + 1
+    assert len(document.section_pages) == expected_sections
     print(f'Created {len(reader.pages)} pages, {len(fields)} form fields, {len(document.section_pages)} bookmarks.')
     for title, page in document.section_pages:
         print(f'{page:02d} {title}')

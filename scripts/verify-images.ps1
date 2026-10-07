@@ -28,7 +28,8 @@ try {
     $files = & git -C $root ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate repository source.' }
     foreach ($file in $files) {
-        if ($file -notmatch '^(\.dockerignore|global\.json|Kilo\.slnx)$|^Kilo(\.Migrations)?/') { continue }
+        if ($file -notmatch '^(\.dockerignore|global\.json|Kilo\.slnx)$|^Kilo(\.Migrations|\.Persistence)?/') { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $root $file))) { continue }
         $destination = Join-Path $context $file
         New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $root $file) -Destination $destination

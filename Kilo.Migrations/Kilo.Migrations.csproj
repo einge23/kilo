@@ -9,8 +9,7 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
   <ItemGroup>
-    <EmbeddedResource Include="Migrations/*.sql" />
-    <PackageReference Include="dbup-postgresql" Version="7.0.1" />
+    <ProjectReference Include="../Kilo.Persistence/Kilo.Persistence.csproj" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
   </ItemGroup>
 </Project>
