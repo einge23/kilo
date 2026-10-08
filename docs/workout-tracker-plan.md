@@ -22,7 +22,7 @@ Use each slice's fillable progress panel for implementation, verification, statu
 - Asp.Versioning.Mvc supplies URL-segment versioning. It replaces the hand-built ApiV1Controller routing base.
 - Native MVC validation returns 400. The previous custom 422 split is intentionally removed before the first client is built.
 - Native health checks use KiloDbContext.Database.CanConnectAsync. EF Core owns mapping, scoped contexts, pooled connections, and transactions.
-- Generated EF migrations and their model snapshot grow with the slices. The separate migrator applies them through MigrateAsync; a guarded one-time adoption path covers the retained users baseline.
+- Generated EF migrations and their model snapshot grow with the slices. The separate migrator applies them through MigrateAsync. All runtime schema changes use native EF migrations.
 - Feature folders grow inside one API project. Kilo.Persistence shares the model and migrations between the API and separate migrator; Kilo.Tests verifies their behavior. No further architecture layers are needed.
 
 ---page---
@@ -66,7 +66,7 @@ Wednesday (3): Upper A. Thursday (4): Lower A. Friday (5): Abs and Arms. Saturda
 
 ## One API, feature folders, explicit dependencies
 
-Keep the existing Kilo and Kilo.Migrations project names. Start with Hosting for service registration and readiness. Add Features/Me, Exercises, Routines, Schedule, and Sessions only when their slice begins. Keep request/response contracts and real workflow services beside their API feature. Add entities and Fluent mappings to Kilo.Persistence only when used. Move a genuinely shared WeightDto into Shared when a second feature needs it.
+Keep the existing Kilo and Kilo.Migrations project names. Start with Hosting for service registration and readiness. Add Features/Me, Exercises, Routines, Schedule, and Sessions only when their slice begins. Keep request/response contracts and real workflow services beside their API feature. Add entities under Kilo.Persistence/Entities and Fluent mappings only when used. Move a genuinely shared WeightDto into Shared when a second feature needs it.
 
 Controllers bind requests and translate outcomes into HTTP. Inject KiloDbContext directly for simple CRUD; extract a concrete workflow service for a real multi-step transaction. EF already supplies change tracking and a unit of work. Do not wrap it in repositories, a custom unit of work, AutoMapper, MediatR, a universal Result type, or four Clean Architecture projects.
 
@@ -98,13 +98,13 @@ Kilo/
   Hosting/                  # API registrations and readiness
   Features/                 # added feature by feature
 Kilo.Persistence/
-  User.cs / KiloDbContext.cs
+  Entities/User.cs
+  KiloDbContext.cs
   DatabaseServiceCollectionExtensions.cs
   KiloDbContextFactory.cs    # design-time EF tooling
   Migrations/               # generated C#, designers, model snapshot
 Kilo.Migrations/
   Program.cs                # separate MigrateAsync executable
-  LegacyBaselineAdoption.cs # explicit known-baseline bridge
 Kilo.Tests/                 # real PostgreSQL and HTTP checks
 ```
 
@@ -128,7 +128,7 @@ Archive columns and active-position indexes belong to the original table migrati
 
 The separate executable calls Database.MigrateAsync and records public.__EFMigrationsHistory. Repeat runs apply only pending migrations. EF owns locking and normal migration transactions; do not wrap MigrateAsync in an application transaction or promise the whole release rolls back. Review generated operations that suppress transactions. Run one migrator per deployment and activate the API only after success [8].
 
-The existing pre-EF users baseline has an explicit adoption path described below. Unknown schemas, UUID imports, and pounds-only conversions require separate inventory and migration design; never infer a baseline or delete the volume to make startup pass.
+Only native EF migration history is supported. An existing database created by another migration system needs a backup, inventory, and separate conversion plan. Never infer a baseline, fabricate history, or delete retained volumes to make startup pass.
 
 ---page---
 # Slice 01 - Foundation scope and setup
@@ -148,7 +148,7 @@ Slices 01-03 already exist. This revision converts their persistence to EF while
 3. In Persistence pin Microsoft.EntityFrameworkCore.Relational 10.0.12, Microsoft.EntityFrameworkCore.Design 10.0.12 (PrivateAssets=all), Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3, and configuration environment support 10.0.12. Keep Hosting 10.0.12 in the migrator. The provider brings Npgsql; remove the former data-access packages.
 4. Add User, KiloDbContext, shared database registration, and a design-time factory. Keep API hosting extensions and slim Program.cs.
 5. Pin dotnet-ef 10.0.12 in the local tool manifest. Generate CreateUsers in Persistence/Migrations; commit its designer and model snapshot. Never generate future tables in this baseline.
-6. Run the separate migrator twice against a disposable real Postgres database, check readiness, and run the foundation suite. Adopt retained pre-EF databases only through the explicit audited path.
+6. Run the separate migrator twice against a disposable real Postgres database, check readiness, and run the foundation suite. Use an empty database or one already managed by these EF migrations. No legacy migration compatibility code remains.
 
 ## SDK selection
 
@@ -315,7 +315,7 @@ This is partial, not a slice-one endpoint. Use a test-only v1 controller for fou
 
 ## Kilo.Migrations/Program.cs - native EF runner
 
-The production entry point also validates configuration, clears data-bearing log providers, and optionally invokes the explicit baseline bridge. This is its core lifecycle; see the repository's complete Program.cs for those guards.
+The production entry point validates configuration and clears data-bearing log providers. This is its core lifecycle; see the repository's complete Program.cs for those guards.
 
 ```csharp
 builder.Services.AddKiloDatabase(builder.Configuration);
@@ -345,14 +345,20 @@ KiloDbContextFactory implements IDesignTimeDbContextFactory<KiloDbContext>. It r
 ---page---
 # Slice 01 - User model and schema mapping
 
-## Kilo.Persistence/User.cs
+## Kilo.Persistence/Entities/User.cs
 
 ```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace Kilo.Persistence.Entities;
+
 public sealed class User
 {
     public int Id { get; set; }
+    [MaxLength(27)]
     public required string ClerkUserId { get; set; }
     public string TimeZone { get; set; } = "UTC";
+    [MaxLength(8)]
     public string MeasurementSystem { get; set; } = "imperial";
     public DateTime CreatedAt { get; set; }
 }
@@ -385,10 +391,10 @@ user.Property(x => x.CreatedAt).HasColumnName("created_at")
     .HasColumnType("timestamp with time zone").HasDefaultValueSql("now()");
 ```
 
-KiloDbContext inherits DbContext, accepts DbContextOptions<KiloDbContext>, and exposes DbSet<User> Users. Keep this small mapping together. Split feature entity configurations with IEntityTypeConfiguration only when real growth warrants it. Explicit names retain the schema contract without a naming-convention dependency.
+KiloDbContext inherits DbContext, accepts DbContextOptions<KiloDbContext>, and exposes DbSet<User> Users. User lives in the Entities namespace. TimeZone stores IANA names without a three-character limit. Length annotations remain model/validation metadata; explicit PostgreSQL text mappings do not enforce these lengths. Keep this small mapping together. Split feature entity configurations with IEntityTypeConfiguration only when real growth warrants it. Explicit names retain the schema contract without a naming-convention dependency.
 
 ---page---
-# Slice 01 - Migration lifecycle and retained databases
+# Slice 01 - Migration lifecycle
 
 ## Generate, review, then run the separate migrator
 
@@ -404,17 +410,15 @@ dotnet run --project Kilo.Migrations
 
 AddExercises is the example for slice 05, not a command to run now. Review both generated C# and provider SQL for loss, defaults, constraints, indexes, and lock cost. After generating the intended migration, pending-model checking must pass. Commit migration, designer, and snapshot together. Only the separate executable applies deployment migrations; script output is for review. Never use EnsureCreated alongside migrations [8].
 
-## Explicit adoption of the retained users baseline
+## EF-only database setup
 
-An existing pre-EF volume must not be treated as empty. Back it up, stop the API, and inventory its schema and old journal before running the flag below. README contains the exact Compose runbook.
+Use an empty database or one carrying the native history for this application's EF migrations. The former SQL migrator and its compatibility bridge are removed. The serving API never creates or adopts database schema.
 
-```powershell
-dotnet run --project Kilo.Migrations -- --adopt-legacy-baseline
-```
+An existing non-EF database is not an empty installation. Back it up and inventory it before planning a separate conversion, or select a new empty database for development. Do not insert history entries by hand, remove retained volumes, or change an applied EF migration to force success. Removing old migration code does not delete existing data.
 
-The bridge recognizes only the previously shipped users baseline: exactly five expected columns/defaults/identity settings, the named checks and keys, one known journal entry, no other application tables or user triggers, and no applied EF migrations. It locks users, audits inside a transaction, and writes the CreateUsers history entry using the provider's native history scripts. It preserves all rows, IDs, sequence state, and the old journal as historical metadata, then applies pending EF migrations normally.
+## Keep entity organization separate from schema changes
 
-Repeat ordinary migrations without the flag. Drift or an already-adopted database makes the flag fail; inspect and design a specific change instead of inventing history or editing an applied migration. The normal runner fails on an unadopted populated schema. Tests cover preservation and rejection against disposable legacy fixtures; they do not alter the user's local volume.
+Place persistence entities in Kilo.Persistence/Entities. The User namespace and approved length annotations are captured in the additive OrganizeUserEntity migration, designer, and snapshot. Its generated Up/Down contain no schema operations. The applied CreateUsers files remain unchanged; pending-model checks must pass. Future model changes still generate additive EF migrations through the same pinned tool.
 
 ---page---
 # Slice 01 - Configuration and verification gate
@@ -466,7 +470,7 @@ Create Kilo.Tests with the chosen stable xUnit runner and Microsoft.AspNetCore.M
 - Force the second command of a test transaction to fail; disposal rolls back the first. Exercise cancellation while a query is active and show a later scoped context still succeeds.
 - Run the migrator with invalid configuration/a failing unapplied EF migration; assert nonzero exit. Confirm the serving executable never runs migrations.
 
-Also assert scoped context lifetime, no pending model changes, database constraints through SaveChanges, and safe baseline adoption/rejection.
+Also assert scoped context lifetime, no pending model changes, database constraints through SaveChanges, and persistence of full IANA time zone names after migration replay.
 
 ## Done means
 

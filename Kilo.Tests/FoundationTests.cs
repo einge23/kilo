@@ -6,6 +6,7 @@ using Asp.Versioning;
 using Kilo.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Kilo.Hosting;
+using Kilo.Persistence.Entities;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -97,11 +98,16 @@ public sealed class FoundationTests
             Assert.Equal("imperial", fixture.MeasurementSystem);
             Assert.Equal(DateTimeKind.Utc, fixture.CreatedAt.Kind);
             var migrations = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
-            Assert.Single(migrations);
+            Assert.Equal(db.Database.GetMigrations(), migrations);
+            fixture.TimeZone = "America/Phoenix";
+            Validator.ValidateObject(fixture, new ValidationContext(fixture), validateAllProperties: true);
+            await db.SaveChangesAsync();
             var second = await RunMigrator(connectionString);
             Assert.True(second.ExitCode == 0, second.Output);
             Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
-            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
+            var retained = await db.Users.AsNoTracking().SingleAsync();
+            Assert.Equal(fixture.Id, retained.Id);
+            Assert.Equal("America/Phoenix", retained.TimeZone);
 
             await using (var write = CreateContext(connectionString))
             await using (var transaction = await write.Database.BeginTransactionAsync())
@@ -135,39 +141,6 @@ public sealed class FoundationTests
         });
     }
 
-    [PostgresFact]
-    public async Task Explicit_legacy_adoption_preserves_rows_and_rejects_schema_drift()
-    {
-        await WithDatabase(async connectionString =>
-        {
-            await using var db = CreateContext(connectionString);
-            await db.Database.ExecuteSqlRawAsync(LegacyBaseline);
-            var fixture = new User { ClerkUserId = "retained" };
-            db.Users.Add(fixture);
-            await db.SaveChangesAsync();
-            var normal = await RunMigrator(connectionString);
-            Assert.NotEqual(0, normal.ExitCode); // Never silently adopts an unrecognized existing table.
-            var adopted = await RunMigrator(connectionString, "--adopt-legacy-baseline");
-            Assert.True(adopted.ExitCode == 0, adopted.Output);
-            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
-            Assert.Single(await db.Database.GetAppliedMigrationsAsync());
-            Assert.Equal(0, (await RunMigrator(connectionString)).ExitCode);
-            Assert.Equal(fixture.Id, (await db.Users.AsNoTracking().SingleAsync()).Id);
-        });
-        await WithDatabase(async connectionString =>
-        {
-            await using var db = CreateContext(connectionString);
-            await db.Database.ExecuteSqlRawAsync(LegacyBaseline);
-            await db.Database.ExecuteSqlRawAsync("ALTER TABLE users ALTER COLUMN time_zone SET DEFAULT 'GMT'");
-            db.Users.Add(new User { ClerkUserId = "preserve-on-rejection" });
-            await db.SaveChangesAsync();
-            var rejected = await RunMigrator(connectionString, "--adopt-legacy-baseline");
-            Assert.NotEqual(0, rejected.ExitCode);
-            Assert.Empty(await db.Database.GetAppliedMigrationsAsync());
-            Assert.Single(await db.Users.AsNoTracking().ToListAsync());
-        });
-    }
-
     private static KiloDbContext CreateContext(string connectionString) => new(
         new DbContextOptionsBuilder<KiloDbContext>().UseNpgsql(connectionString,
             postgres => postgres.CommandTimeout(15).MigrationsHistoryTable("__EFMigrationsHistory", "public")).Options);
@@ -192,21 +165,6 @@ public sealed class FoundationTests
         }
     }
 
-    // A historical test fixture only; production schema changes are EF migrations.
-    private const string LegacyBaseline = """
-        CREATE TABLE users (
-          id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-          clerk_user_id text NOT NULL UNIQUE,
-          time_zone text NOT NULL DEFAULT 'UTC',
-          measurement_system text NOT NULL DEFAULT 'imperial'
-            CHECK (measurement_system IN ('imperial', 'metric')),
-          created_at timestamptz NOT NULL DEFAULT now(),
-          CHECK (btrim(clerk_user_id) <> '')
-        );
-        CREATE TABLE schemaversions (scriptname text NOT NULL);
-        INSERT INTO schemaversions VALUES ('Kilo.Migrations.Migrations.001_users.sql');
-        """;
-
     private static WebApplicationFactory<Program> CreateApi(string connectionString) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
@@ -216,7 +174,7 @@ public sealed class FoundationTests
                 services.AddControllers().AddApplicationPart(typeof(ProbeController).Assembly));
         });
 
-    private static async Task<(int ExitCode, string Output)> RunMigrator(string connectionString, params string[] arguments)
+    private static async Task<(int ExitCode, string Output)> RunMigrator(string connectionString)
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root is not null && !File.Exists(Path.Combine(root.FullName, "Kilo.slnx")))
@@ -233,7 +191,6 @@ public sealed class FoundationTests
             CreateNoWindow = true
         };
         start.ArgumentList.Add(assembly);
-        foreach (var argument in arguments) start.ArgumentList.Add(argument);
         start.Environment["DOTNET_ENVIRONMENT"] = "Production";
         start.Environment["ConnectionStrings__Postgres"] = connectionString;
         using var process = Process.Start(start)!;

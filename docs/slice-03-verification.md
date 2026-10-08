@@ -1,6 +1,6 @@
 # Slice 03 verification
 
-Status: **Done** for the current Linux AMD64 Docker host. Reverified after the EF Core transition at 2026-10-07T17:15:17.3916756+00:00 on Docker Compose 2.31.0.
+Status: **Done** for the current Linux AMD64 Docker host. Reverified after the EF-only cleanup and entity organization at 2026-10-08T03:34:16.3019223+00:00 (October 7 in Phoenix) on Docker Compose 2.31.0.
 
 ```powershell
 pwsh -NoProfile -File scripts/verify-compose.ps1 -Platform linux/amd64
@@ -22,14 +22,14 @@ The base configuration also rejected a missing password. Its DB password and bot
 
 The check added `20991231235959_ComposeGate_<random-id>` as a C# EF migration only to a temporary source snapshot. It created a test table, inserted a row, then executed division by zero. The migrator emitted the sanitized failure diagnostic, the table did not exist afterward, the failed migration had no native EF history entry, and the existing users fixture survived.
 
-The repair removed the failing statement from that same unapplied fixture migration. A new migration container applied it successfully, leaving the repaired marker and exactly one new journal entry. Another fresh migration run left the journal count unchanged. No applied repository migration was edited; `Kilo.Persistence/Migrations` contains only the generated CreateUsers migration, designer, and current model snapshot.
+The repair removed the failing statement from that same unapplied fixture migration. A new migration container applied it successfully, leaving the repaired marker and exactly one new journal entry. Another fresh migration run left the journal count unchanged. No applied repository migration was edited; `Kilo.Persistence/Migrations` contains generated CreateUsers and OrganizeUserEntity migrations, their designers, and the current model snapshot.
 
 The running API was removed before the failure phase because Compose dependency conditions apply to startup. The README provides the corresponding local update commands to stop the API and replace the completed migrator before rebuilding the stack. See [Compose startup ordering](https://docs.docker.com/compose/how-tos/startup-order/).
 
 ## Cleanup and carry forward
 
-The check removed its containers, network, named volume, image tags, and temporary source files. Cleanup was confirmed by Docker resource listings; only the original `kilo-api-1` and `kilo-db-1` containers remained running. Sanitized machine-readable results stay under ignored `.artifacts/kilo-compose-check-*/checks.json`.
+The check removed its containers, network, named volume, image tags, and temporary source files. Cleanup was confirmed by Docker resource listings; the existing `kilo-api-1`, `kilo-migrations-1`, and `kilo-db-1` containers were preserved. Sanitized machine-readable results stay under ignored `.artifacts/kilo-compose-check-*/checks.json`.
 
 The production Compose and development override needed no changes. Temporary random-port replacement uses native [`!override`](https://docs.docker.com/reference/compose-file/merge/) and requires Compose 2.24.4 or newer. No Compose unit-test framework was added.
 
-Slice 04 can now extend registration with Clerk identity and authorization. The cumulative plan and canonical PDF now use EF models, LINQ, tracked writes, and native migrations. See the [transition record](ef-core-transition.md) and retained-volume adoption runbook before updating an existing pre-EF local stack.
+Slice 04 can now extend registration with Clerk identity and authorization. The cumulative plan and canonical PDF now use EF models, LINQ, tracked writes, and native migrations. See the [transition record](ef-core-transition.md) and EF-only database setup notes in README before updating a retained non-EF local stack.

@@ -1,3 +1,4 @@
+using Kilo.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
 
 namespace Kilo.Persistence;

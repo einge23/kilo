@@ -1,6 +1,6 @@
 # Kilo
 
-The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, and a separate EF migrator. Clerk and business endpoints arrive in later slices. The [EF transition record](docs/ef-core-transition.md) summarizes the completed checks and retained-volume adoption path.
+The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, and a separate EF migrator. Clerk and business endpoints arrive in later slices. The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
 
@@ -84,11 +84,11 @@ Compose uses password authentication with `GSS Encryption Mode=Disable` to avoid
 dotnet test Kilo.slnx --no-restore
 ```
 
-Configuration, native HTTP/versioning/validation, scoped context lifetime and model-snapshot consistency, and unavailable-readiness checks run without a database. The Postgres checks report **Skipped** until `KILO_TEST_POSTGRES` supplies an admin connection with CREATE DATABASE permission. It creates and drops its own uniquely named test databases; it never migrates the supplied admin database. With that variable set, it verifies migrations twice, identity/defaults, transactional rollback, cancellation, healthy readiness, database constraint enforcement, and explicit legacy adoption/preservation/drift rejection.
+Configuration, native HTTP/versioning/validation, scoped context lifetime and model-snapshot consistency, and unavailable-readiness checks run without a database. The Postgres check reports **Skipped** until `KILO_TEST_POSTGRES` supplies an admin connection with CREATE DATABASE permission. It creates and drops its own uniquely named test databases; it never migrates the supplied admin database. With that variable set, it verifies migrations twice, identity/defaults, transactional rollback, cancellation, healthy readiness and database constraint enforcement.
 
 ## EF migration development
 
-`Kilo.Persistence` owns the entities, Fluent schema mapping, generated migrations, and model snapshot. Both executables reference it. Use native EF LINQ/DTO projections for reads and tracked changes with `SaveChangesAsync` for writes; no repository or connection wrapper is needed.
+`Kilo.Persistence/Entities` holds persistence entities; `Kilo.Persistence` owns Fluent schema mapping, generated migrations, and model snapshot. Both executables reference it. Use native EF LINQ/DTO projections for reads and tracked changes with `SaveChangesAsync` for writes; no repository or connection wrapper is needed.
 
 The private Design reference and local tool manifest pin EF tooling to 10.0.12; the Npgsql EF provider is 10.0.3. The design-time factory requires environment `ConnectionStrings__Postgres` and does not inherit executable user secrets. Supply that setting securely for an available local database, then:
 
@@ -103,26 +103,12 @@ dotnet run --project Kilo.Migrations
 
 Review generated operations and SQL, then commit the migration, designer, and snapshot together. CreateUsers is already present; do not regenerate it or generate future slice entities early. Never use EnsureCreated, automatically migrate the API, or alter an applied migration. A failed migration does not undo earlier committed migrations ([EF migration guidance](https://learn.microsoft.com/en-us/ef/core/managing-schemas/migrations/applying)).
 
-## One-time adoption of an existing pre-EF volume
+## EF-only database setup
 
-The retained local stack still uses its earlier users baseline. Its volume has been preserved; this code change does not upgrade a running stack automatically. An ordinary EF migrator intentionally fails against that unadopted schema.
+Use an empty database or one already managed by this application's native EF migration history. The old SQL migrator and compatibility bridge have been removed. The existing local volume is preserved; removing source code does not upgrade or reset a running database.
 
-Back up before adoption. With the existing stack running and configured from your local `.env`, create a logical backup without redirecting native binary output through PowerShell:
+If a retained database was created by the earlier SQL runner, ordinary EF migrations will fail rather than silently adopt it. Back it up and inventory it before designing a separate conversion, or select a new empty database for development. Never fabricate EF history or delete retained volumes to make startup pass.
 
-```powershell
-New-Item -ItemType Directory -Force .artifacts/backups | Out-Null
-docker compose exec -T db pg_dump -U postgres -d kilo -Fc -f /tmp/kilo-before-ef.dump
-docker compose exec -T db pg_restore --list /tmp/kilo-before-ef.dump
-$dbContainer = docker compose ps -q db
-docker cp "${dbContainer}:/tmp/kilo-before-ef.dump" .artifacts/backups/kilo-before-ef.dump
-docker compose stop api
-docker compose build api migrations
-docker compose run --rm migrations --adopt-legacy-baseline
-# Proceed only if the preceding command exits 0:
-docker compose rm --stop --force migrations
-docker compose up -d
-```
-
-Use the existing configured database/role names if different. Inventory `public.users` and `public.schemaversions` before running the flag. The bridge requires the exact known five-column users model, named constraints/defaults/identity, a single known legacy script entry, no other application tables/triggers, and no applied EF migrations. It audits and writes the native CreateUsers history row transactionally while locking users; it preserves rows, IDs, identity sequence state, and the legacy journal as historical metadata. Future migrations then apply normally. Schema drift returns a sanitized failure: leave the API stopped, inspect the difference, and design a specific migration. Do not fake journal entries, rerun the flag after adoption, or remove volumes. Use ordinary migration runs thereafter. Tests exercise adoption against disposable legacy databases; the existing local volume was not changed.
+`User` is now in `Kilo.Persistence/Entities/User.cs`. Its namespace is `Kilo.Persistence.Entities`. `OrganizeUserEntity` records the namespace and approved length annotations in generated metadata without changing database columns; the applied `CreateUsers` migration remains intact. Time zones retain their unrestricted text mapping, supporting IANA names such as `America/Phoenix`.
 
 The API never migrates on startup. The migrator returns nonzero with a sanitized diagnostic on failure. Health uses the native `Healthy`/`Unhealthy` response with 200/503; HTTP errors use ProblemDetails and standard MVC validation returns 400.

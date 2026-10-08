@@ -1,18 +1,18 @@
 # Slice 02 verification
 
-Status: **Done** for the current Linux AMD64 Docker host. Reverified October 7, 2026 after the EF Core transition.
+Status: **Done** for the current Linux AMD64 Docker host. Reverified October 7, 2026 (Phoenix) after the EF-only cleanup and entity organization.
 
 ## Build and runtime gate
 
 ```powershell
-pwsh -NoProfile -File scripts/verify-images.ps1 -Release efcore-20261007-final -Platform linux/amd64
+pwsh -NoProfile -File scripts/verify-images.ps1 -Release ef-cleanup-entities-20261007 -Platform linux/amd64
 ```
 
 The command completed successfully. It built both Release images with `--pull --no-cache`, locked NuGet restores, and a clean source snapshot. Neither build required a database or supplied database credentials. The runtime probe is a dependency-free helper outside the application solution and is mounted only into temporary verification containers; it is not included in either release image.
 
 | Acceptance | Evidence |
 | --- | --- |
-| 02.1 Clean image builds | Both Docker builds succeeded from source without local bin/obj. The migrator image discovers one compiled EF migration, `CreateUsers`, in shared `Kilo.Persistence.dll`. Its EF runtime dependencies load successfully. |
+| 02.1 Clean image builds | Both Docker builds succeeded from source without local bin/obj. The migrator image discovers the compiled EF migrations, `CreateUsers` and `OrganizeUserEntity`, in shared `Kilo.Persistence.dll`. Its EF runtime dependencies load successfully. |
 | 02.2 Target architecture | Both image metadata and running .NET processes reported Linux AMD64/X64. |
 | 02.3 Non-root runtime | Both configured and actual runtime UIDs were 1654. |
 | 02.4 HTTPS/globalization | Both final images completed a trusted HTTPS request to Microsoft Learn, loaded French numeric culture, and resolved America/New_York winter/summer offsets. |
@@ -24,12 +24,12 @@ The separate [slice 03 gate](slice-03-verification.md) reverified fresh EF migra
 
 ## Image identifiers
 
-Both images carry `org.opencontainers.image.version=efcore-20261007-final`.
+Both images carry `org.opencontainers.image.version=ef-cleanup-entities-20261007`.
 
 | Local image tag | Verified local image ID |
 | --- | --- |
-| `kilo:efcore-20261007-final` | `sha256:02a011a1574945c2119600bc38a20f3214690fba73a78b5432c142ca97c1295b` |
-| `kilo-migrations:efcore-20261007-final` | `sha256:07fb0531adeee328b3b30cbd8229624cf9a923cafe232f0bbe09952bbf326427` |
+| `kilo:ef-cleanup-entities-20261007` | `sha256:3775b86b07b33e4e72ed87c2660cfbd3bb4bb9298d5176b8d4001acc5679587b` |
+| `kilo-migrations:ef-cleanup-entities-20261007` | `sha256:560bd97f6457887e6884758a30259a1c10a432c987e0b819b84b242d61efc197` |
 
 These are local build identifiers, not published registry references. A rebuild can produce different image IDs; record the outputs for each release and use a new release tag.
 
@@ -47,4 +47,4 @@ Review base-image security updates explicitly and rerun the gate after changing 
 
 ## Carry forward
 
-Transactional-write shutdown remains deferred until feature writes exist, as required by the workbook, and is rechecked in slice 20. This record does not mark slice 03's persistence/failure gates or later identity/features complete. The plan and canonical PDF now describe cumulative EF implementation. See the [transition record](ef-core-transition.md) for model/tooling checks and retained-volume adoption.
+Transactional-write shutdown remains deferred until feature writes exist, as required by the workbook, and is rechecked in slice 20. This record does not mark slice 03's persistence/failure gates or later identity/features complete. The plan and canonical PDF now describe cumulative EF implementation. See the [transition record](ef-core-transition.md) for model/tooling checks and cleanup.
