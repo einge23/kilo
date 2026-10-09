@@ -81,7 +81,7 @@ Created: 201 with Location. Read/update: 200. Archive/delete: 204. Missing/inval
 
 ## Database and time
 
-Register KiloDbContext with AddDbContext: one scoped context per request or migrator scope, never a singleton. Await operations sequentially; a context is not thread-safe. Pass CancellationToken to queries, SaveChangesAsync, transactions, and migrations. Use AsNoTracking and DTO projections for reads, tracked entities for writes, and a bounded provider command timeout. Private resource predicates include verified local userId; exercise reads additionally allow global rows (user_id IS NULL); never use unscoped FindAsync for tenant resources. Composite foreign keys enforce ownership as a second defense.
+Register KiloDbContext with AddDbContext: one scoped context per request or migrator scope, never a singleton. Await operations sequentially; a context is not thread-safe. Pass CancellationToken to queries, SaveChangesAsync, transactions, and migrations. Use AsNoTracking and DTO projections for reads, tracked entities for writes, and a bounded provider command timeout. From 06, use Persistence.Queries.OwnershipQueryExtensions.OwnedBy(userId) for mapped UserId entities with a verified positive local ID. Compose resource/nesting/archive predicates afterward. Exercise global reads and admin policies remain explicit; never use unscoped FindAsync for private resources. Composite foreign keys enforce ownership as a second defense.
 
 Postgres identity columns generate positive integer keys; gaps are normal. Clerk subjects and retry keys remain text. Use timestamptz for UTC instants and date for optional scheduled dates. The Npgsql EF provider maps timestamptz to UTC DateTime and date to DateOnly; map both explicitly in the model. Use TimeProvider for application-generated timestamps, including deterministic timer tests.
 
@@ -813,28 +813,45 @@ Reuse DTO validation for private routines and the shared Testcontainers/Bogus pa
 
 ## Already exists
 
-Exercise feature patterns and user isolation. Generate AddRoutines; keep the established startup and authentication code.
+Exercise CRUD, scoped CurrentUser, automatic validator registration, native 422 responses, and KiloApiFactory. Reuse these patterns; keep startup and authentication unchanged.
 
 ## Add and implement
 
-1. Add Features/Routines with requests/responses, controller, and Routine entity/mapping. Use direct scoped EF CRUD; extract a named workflow only when operations become transactional.
-2. Implement create, private list, detail, and metadata replacement. Require a nonblank trimmed name; description is optional and normalizes to empty string.
-3. Detail returns exercises=[] until 07 adds placements. Avoid querying a table that does not exist yet. When children arrive, extend the same detail assembler rather than duplicating the endpoint.
-4. Filter archived routines from default lists, allow includeArchived explicitly, and reject metadata edits of owned archived routines with 409. Foreign/missing routine is 404.
-5. Direct DbContext CRUD needs no additional DI registration. When a real workflow service appears, register it as scoped; group cohesive registrations only when useful. No service-location or reflection scan is needed.
+1. Add Features/Routines and Entities/Routine. Generate AddRoutines/designer/snapshot with required owner FK, restricted deletion, name check, (id, userId) key, active-list index and UTC defaults.
+2. Add RoutineWriteRequest/Validator; await validation before provisioning/writes. Trim nonblank name; omitted/null description becomes empty. Lists use RoutineSummaryDto; detail/create/update use RoutineDto.
+3. Detail returns exercises=[] until 07 adds typed placements. Creation returns 201 with CreatedAtAction version="1" and id; reads/updates return 200.
+4. Scope reads/updates with db.Routines.OwnedBy(userId), using verified CurrentUser. Admins remain private owners. Lists order by name/id and support includeArchived. Archived detail is readable; update is 409. Foreign/missing IDs are 404.
+5. OwnedBy uses native EF.Property on integer/nullable UserId; positive verified caller IDs only, null/global owners excluded. Reuse it for private exercise updates and future private entities. Keep nesting/archive/policy checks explicit; no new service or DI registration.
 
-Routes: GET/POST /routines; GET/PUT /routines/{id}. Creating an empty routine is valid. It cannot start a workout until it contains active planned sets.
+Routes: GET/POST /routines; GET/PUT /routines/{id}. Empty routines are valid; placement/set features arrive in 07/08 and archive endpoints in 15.
+
+---page---
+# Slice 06 - Ownership queries and verification
+
+## Reuse the private query filter
+
+Import Kilo.Persistence.Queries. OwnedBy(userId) uses native EF.Property<int?> on the mapped UserId; it works with required routine and nullable exercise owners. Supply only a verified positive local ID. Null/global and foreign owners never match. Append resource IDs, nesting and archive rules before materializing. Creation still assigns its owner explicitly; admin/global visibility stays a separate policy/predicate.
+
+```csharp
+// Controller body; existing scoped db and CurrentUser dependencies.
+var userId = await currentUser.GetIdAsync(ct);
+var routine = await db.Routines.OwnedBy(userId)
+    .SingleOrDefaultAsync(x => x.Id == id, ct);
+// Missing/foreign -> 404; owned archived mutation -> 409.
+```
+
+The extension is a query predicate, not automatic authorization. Do not use it on Users (whose own ID is Id), in-memory collections, or entities without a mapped integer UserId. Private child predicates must still include the correct parent; composite FKs remain the second defense. No identity dependency is added to the shared DbContext or migrator.
 
 ## Gate
 
-- Create Upper A, Lower A, Abs and Arms, Upper B, Lower B with distinct generated IDs.
-- Create empty routines with/without descriptions; verify detail collections are empty rather than null.
-- Add RoutineWriteRequestValidator; reject blank names with 422 and no row. Exercise standard missing/foreign detail/update 404 and archived update 409.
-- A second account lists none of the first account's routines. Created Location works with the API version.
+- Create the five named templates, round-trip descriptions and Location links, and verify positive IDs and exercises=[] in the wire response.
+- Verify deterministic lists, includeArchived, owned archived 409, and private/missing 404 including signed admins. Ignore client owner/scope/archive fields.
+- Reject missing/null/blank names with standardized 422; malformed/type-binding/absent bodies stay 400. Rejections neither provision nor mutate; unauthenticated calls return 401.
+- Verify OwnedBy against required and nullable owner columns in PostgreSQL, including global exclusion, query composition and tracked writes. Upgrade seeded users/exercises and replay the migrator without loss.
 
-## Acceptance
+## Acceptance and evidence
 
-06.1 Routine create/list works. 06.2 Empty templates are valid. 06.3 Names are validated. 06.4 Routine ownership is enforced.
+06.1 Routine CRUD. 06.2 Empty templates. 06.3 Async validation. 06.4 Verified ownership. The October 8 gate passed with 114 tests, additive migration upgrade/replay, Linux images and isolated Compose. See docs/slice-06-verification.md. Next: 07 placements.
 
 @progress 06
 
@@ -1390,13 +1407,15 @@ Run against the Linux host through HTTPS. Retain evidence before marking the app
 
 The repository implements slices 01-03 with EF persistence and a separate MigrateAsync executable. The transition verification record and slice-02/03 records contain the actual build, real-Postgres, image, and Compose checks. PDF regeneration does not prove a feature gate passed.
 
-Slice 04 implements Clerk identity, local profiles and preferences; its original gate passed with 35 tests (docs/slice-04-verification.md). Slice 05 adds global/private exercises and native admin policies. Its gate passed with 72 tests, seeded EF upgrade/replay and refreshed image/Compose checks (docs/slice-05-verification.md). Slices 06-20 remain planned. SQL contracts describe future mappings, not authorization to generate all tables now.
+Slice 04 implements Clerk identity, local profiles and preferences; its original gate passed with 35 tests (docs/slice-04-verification.md). Slice 05 adds global/private exercises and native admin policies. Its gate passed with 72 tests, seeded EF upgrade/replay and refreshed image/Compose checks (docs/slice-05-verification.md). Slices 07-20 remain planned. SQL contracts describe future mappings, not authorization to generate all tables now.
 
 Request validation now uses automatically registered FluentValidation validators and standardized 422 errors. The follow-up verification passed 89 tests with no skips; see docs/request-validation-verification.md. Earlier slice records retain their original evidence and validation policy.
 
-## Continue with 06 when requested
+Slice 06 adds private routine metadata and the reusable OwnedBy query filter. Its gate passed with 114 tests, seeded upgrades, four compiled EF migrations, Linux images and isolated Compose; see docs/slice-06-verification.md.
 
-Retain the scoped context, native migration history, slim startup, exercise validation, global/private boundaries and shared KiloApiFactory. Routine templates remain private; placement/snapshot access keys arrive only in 07/10 and archive writes in 15. Configure the real Clerk role/session claim as documented. No future feature scaffolding is needed.
+## Continue with 07 when requested
+
+Retain scoped EF, native migration history, slim startup, async validators, OwnedBy predicates and shared KiloApiFactory. Routine templates stay private; placement/snapshot access keys arrive in 07/10 and archive writes in 15. Configure the real Clerk role/session claim as documented. No future feature scaffolding is needed.
 
 ---page---
 # API reference - route catalog
@@ -1640,7 +1659,7 @@ Null user_id is global; a positive user_id references its custom owner. Use rest
 ```sql
 CREATE TABLE routines (
     id              integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    user_id         integer NOT NULL REFERENCES users(id),
+    user_id         integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     name            text NOT NULL,
     description     text NOT NULL DEFAULT '',
     archived_at     timestamptz,

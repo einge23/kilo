@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using Kilo.Features.Me;
+using Kilo.Features.Routines;
 using Kilo.Persistence;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
@@ -16,6 +17,32 @@ namespace Kilo.Tests.IntegrationTests;
 
 public sealed class ClerkAuthenticationTests(ClerkApiFactory factory) : IClassFixture<ClerkApiFactory>
 {
+    [Fact]
+    public async Task Routines_use_verified_subject_and_remain_private_from_signed_admins()
+    {
+        var subject = NewSubject();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", factory.Token(subject));
+        client.DefaultRequestHeaders.Add(KiloApiFactory.SubjectHeader, NewSubject());
+        using var created = await client.PostAsJsonAsync("/api/v1/routines", new { name = subject, userId = int.MaxValue });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var routine = (await created.Content.ReadFromJsonAsync<RoutineDto>())!;
+
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", factory.Token(NewSubject(), role: "admin"));
+        using var hidden = await client.GetAsync($"/api/v1/routines/{routine.Id}");
+        using var denied = await client.PutAsJsonAsync($"/api/v1/routines/{routine.Id}", new { name = "Not owned" });
+        Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, denied.StatusCode);
+        Assert.Empty((await client.GetFromJsonAsync<RoutineSummaryDto[]>("/api/v1/routines?includeArchived=true"))!);
+
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", factory.Token(subject));
+        Assert.Equal(routine, await client.GetFromJsonAsync<RoutineDto>($"/api/v1/routines/{routine.Id}"));
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
+        var userId = await db.Users.Where(x => x.ClerkUserId == subject).Select(x => x.Id).SingleAsync();
+        Assert.Equal(userId, (await db.Routines.AsNoTracking().SingleAsync(x => x.Id == routine.Id)).UserId);
+    }
+
     [Theory]
     [InlineData("admin", HttpStatusCode.Created)]
     [InlineData("user", HttpStatusCode.Forbidden)]
@@ -74,10 +101,15 @@ public sealed class ClerkAuthenticationTests(ClerkApiFactory factory) : IClassFi
         Assert.Equal(HttpStatusCode.Unauthorized, deniedRead.StatusCode);
         using var deniedCustom = await client.PostAsJsonAsync("/api/v1/exercises", new { name = subject, role = "admin" });
         Assert.Equal(HttpStatusCode.Unauthorized, deniedCustom.StatusCode);
+        using var deniedRoutines = await client.GetAsync("/api/v1/routines");
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedRoutines.StatusCode);
+        using var deniedRoutineWrite = await client.PostAsJsonAsync("/api/v1/routines", new { name = subject });
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedRoutineWrite.StatusCode);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
         Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == subject));
         Assert.False(await db.Exercises.AnyAsync(exercise => exercise.Name == subject));
+        Assert.False(await db.Routines.AnyAsync(routine => routine.Name == subject));
     }
 
     [Fact]

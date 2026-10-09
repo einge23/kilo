@@ -86,8 +86,10 @@ public sealed class FoundationTests
         Assert.Contains("ConnectionStrings:Postgres is required.", result.Output);
     }
 
-    [Fact]
-    public async Task Ef_migrations_repeat_and_transactions_roll_back_failures_and_cancellation()
+    [Theory]
+    [InlineData("OrganizeUserEntity")]
+    [InlineData("AddExercises")]
+    public async Task Ef_migrations_repeat_and_transactions_roll_back_failures_and_cancellation(string baseline)
     {
         await using var postgres = new PostgreSqlBuilder("postgres:18.6-alpine")
             .WithDatabase("kilo_foundation_" + Guid.NewGuid().ToString("N"))
@@ -99,18 +101,34 @@ public sealed class FoundationTests
             GssEncryptionMode = GssEncryptionMode.Disable,
             Timeout = 5
         }.ConnectionString;
+        Exercise[] upgradeExercises = [];
         await using (var previous = CreateContext(connectionString))
         {
-            var previousMigration = previous.Database.GetMigrations().Single(id => id.EndsWith("_OrganizeUserEntity", StringComparison.Ordinal));
+            var previousMigration = previous.Database.GetMigrations().Single(id => id.EndsWith("_" + baseline, StringComparison.Ordinal));
             await previous.GetService<IMigrator>().MigrateAsync(previousMigration, timeout.Token);
             Assert.DoesNotContain(await previous.Database.GetAppliedMigrationsAsync(timeout.Token),
-                id => id.EndsWith("_AddExercises", StringComparison.Ordinal));
+                id => id.EndsWith("_AddRoutines", StringComparison.Ordinal));
             var upgradeUser = new User
             {
                 ClerkUserId = "upgrade_fixture", TimeZone = "America/Phoenix", MeasurementSystem = "metric"
             };
             previous.Users.Add(upgradeUser);
             await previous.SaveChangesAsync(timeout.Token);
+            if (baseline == "AddExercises")
+            {
+                upgradeExercises =
+                [
+                    new Exercise { Name = "Retained global", BrandName = "ACME", Description = "Global metadata" },
+                    new Exercise { UserId = upgradeUser.Id, Name = "Retained custom", Description = "Private metadata", ArchivedAt = DateTime.UtcNow }
+                ];
+                previous.Exercises.AddRange(upgradeExercises);
+                await previous.SaveChangesAsync(timeout.Token);
+                foreach (var exercise in upgradeExercises)
+                {
+                    // Capture the stored PostgreSQL microsecond precision before the upgrade.
+                    await previous.Entry(exercise).ReloadAsync(timeout.Token);
+                }
+            }
         }
         var first = await RunMigrator(connectionString);
         Assert.True(first.ExitCode == 0, first.Output);
@@ -127,7 +145,11 @@ public sealed class FoundationTests
         Assert.Equal(db.Database.GetMigrations(), migrations);
         fixture.TimeZone = "America/Phoenix";
         Validator.ValidateObject(fixture, new ValidationContext(fixture), validateAllProperties: true);
+        var routine = new Routine { UserId = fixture.Id, Name = "Replay fixture", Description = "Routine metadata" };
+        db.Routines.Add(routine);
         await db.SaveChangesAsync();
+        Assert.True(routine.Id > 0);
+        Assert.Equal(DateTimeKind.Utc, routine.CreatedAt.Kind);
         var second = await RunMigrator(connectionString);
         Assert.True(second.ExitCode == 0, second.Output);
         Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
@@ -137,6 +159,21 @@ public sealed class FoundationTests
         Assert.Equal("America/Phoenix", upgraded.TimeZone);
         Assert.Equal("metric", upgraded.MeasurementSystem);
         Assert.Equal("America/Phoenix", retained.TimeZone);
+        var retainedRoutine = await db.Routines.AsNoTracking().SingleAsync(x => x.Id == routine.Id);
+        Assert.Equal(routine.UserId, retainedRoutine.UserId);
+        Assert.Equal(routine.Name, retainedRoutine.Name);
+        Assert.Equal(routine.Description, retainedRoutine.Description);
+        Assert.Equal(routine.CreatedAt, retainedRoutine.CreatedAt);
+        foreach (var original in upgradeExercises)
+        {
+            var saved = await db.Exercises.AsNoTracking().SingleAsync(x => x.Id == original.Id);
+            Assert.Equal(original.UserId, saved.UserId);
+            Assert.Equal(original.Name, saved.Name);
+            Assert.Equal(original.Description, saved.Description);
+            Assert.Equal(original.BrandName, saved.BrandName);
+            Assert.Equal(original.ArchivedAt, saved.ArchivedAt);
+            Assert.Equal(original.CreatedAt, saved.CreatedAt);
+        }
 
         await using (var write = CreateContext(connectionString))
         await using (var transaction = await write.Database.BeginTransactionAsync())

@@ -7,6 +7,7 @@ public sealed class KiloDbContext(DbContextOptions<KiloDbContext> options) : DbC
 {
     public DbSet<User> Users => Set<User>();
     public DbSet<Exercise> Exercises => Set<Exercise>();
+    public DbSet<Routine> Routines => Set<Routine>();
 
     protected override void OnModelCreating(ModelBuilder model)
     {
@@ -46,5 +47,20 @@ public sealed class KiloDbContext(DbContextOptions<KiloDbContext> options) : DbC
         exercise.HasIndex(x => new { x.UserId, x.Name }).HasDatabaseName("exercises_active_list")
             .HasFilter("archived_at IS NULL");
 
+        var routine = model.Entity<Routine>();
+        routine.ToTable("routines", table =>
+            table.HasCheckConstraint("routines_name_check", "btrim(name) <> ''"));
+        routine.HasKey(x => x.Id).HasName("routines_pkey");
+        routine.HasAlternateKey(x => new { x.Id, x.UserId }).HasName("routines_id_user_id_key");
+        routine.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+        routine.Property(x => x.UserId).HasColumnName("user_id");
+        routine.Property(x => x.Name).HasColumnName("name").HasColumnType("text");
+        routine.Property(x => x.Description).HasColumnName("description").HasColumnType("text").HasDefaultValue("");
+        routine.Property(x => x.ArchivedAt).HasColumnName("archived_at").HasColumnType("timestamp with time zone");
+        routine.Property(x => x.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").HasDefaultValueSql("now()");
+        routine.HasOne<User>().WithMany().HasForeignKey(x => x.UserId)
+            .OnDelete(DeleteBehavior.Restrict).HasConstraintName("routines_user_id_fkey");
+        routine.HasIndex(x => new { x.UserId, x.Name }).HasDatabaseName("routines_active_list")
+            .HasFilter("archived_at IS NULL");
     }
 }

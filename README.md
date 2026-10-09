@@ -1,6 +1,6 @@
 # Kilo
 
-The current implementation covers slices 01-05 of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, separate EF migrator, release images, local Compose, Clerk identity/preferences, the global/private exercise library. Verification is recorded in [slice 04](docs/slice-04-verification.md) and [slice 05](docs/slice-05-verification.md). The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
+The current implementation covers slices 01-06 of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, separate EF migrator, release images, local Compose, Clerk identity/preferences, the global/private exercise library, and private routine templates. Verification is recorded in [slice 04](docs/slice-04-verification.md), [slice 05](docs/slice-05-verification.md), and [slice 06](docs/slice-06-verification.md). The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
 
@@ -9,6 +9,22 @@ The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contain
 GET `/api/v1/exercises` returns active global entries plus the caller's custom entries, ordered by name then ID; `?includeArchived=true` includes visible archives. GET `/api/v1/exercises/{id}` reads visible detail. POST/PUT on personal routes creates/replaces only the caller's custom metadata. Global POST/PUT uses `/api/v1/admin/exercises` and the native ASP.NET Core `Admin` policy (`RequireAuthenticatedUser()` and `RequireRole("admin")`); JWT roles map to the signed Clerk `role` claim. Admins cannot access another account's private entries. Both routes share name/description/brand validation and return an `isGlobal` DTO without owner IDs.
 
 Run the separate migrator to apply additive `20261008230628_AddExercises`; the API never migrates on startup. Archive endpoints remain slice 15, and placements/snapshots arrive with their own slices. The [slice-05 record](docs/slice-05-verification.md) covers 72 passing tests, migration upgrade/replay, and refreshed image/Compose gates.
+
+## Private routines (slice 06)
+
+GET `/api/v1/routines` returns the caller's active templates ordered by name then ID; `?includeArchived=true` includes owned archives. POST creates a private routine and returns its versioned detail Location. GET/PUT `/api/v1/routines/{id}` reads/replaces owned metadata. Names are trimmed and required; omitted/null descriptions become empty strings. Detail/create/update return `exercises: []` until placements arrive in slice 07. Archived detail remains readable; archived updates return 409. Foreign/missing IDs return 404, including for admins. Requests cannot set owner or archive state.
+
+Apply additive `20261008234727_AddRoutines` through the separate migrator. [Slice-06 verification](docs/slice-06-verification.md) records **114 passing tests**, migration upgrade/replay, release-image and isolated Compose gates.
+
+The reusable [ownership query](Kilo.Persistence/Queries/OwnershipQueryExtensions.cs) composes into EF SQL:
+
+```csharp
+var userId = await currentUser.GetIdAsync(cancellationToken);
+var routine = await db.Routines.OwnedBy(userId)
+    .SingleOrDefaultAsync(x => x.Id == id, cancellationToken);
+```
+
+Import `Kilo.Persistence.Queries`. `OwnedBy` requires an EF-mapped integer/nullable-integer `UserId` and a verified positive local user ID. It excludes null/global owners; apply it before materializing private queries, adding resource/nesting/archive predicates as needed. It does not resolve identity, set an owner on creation, or grant admin/global visibility. Shared exercise reads and native admin writes retain their explicit scope rules.
 
 ## Release images (slice 02)
 
@@ -103,7 +119,7 @@ These tests verify first-request provisioning, existing-profile retrieval, both 
 
 `ClerkAuthenticationTests` uses the real JwtBearer handler with RSA-signed fixture tokens and an in-process HTTP transport serving OIDC discovery and public JWKS documents. It covers concurrent provisioning, rejected signatures/claims/algorithms, 403 policy denials, key rotation, cached-key operation during outages, cold-cache 503 responses, CORS, public readiness, and authenticated production OpenAPI exclusion. It does not contact a real Clerk account; the image gate separately checks outbound trusted HTTPS.
 
-`KiloApiFactory` shares disposable Postgres setup between Me and exercise feature tests; its subject/role headers are test-only and have no production authentication meaning. `ExercisesControllerTests` uses `ExerciseWriteRequestFaker` for global/custom CRUD, versioned Location links, fixed scope, isolation including admins, brand normalization/bounds, native validation, archived filtering and database constraints. Native Clerk tests also verify signed admin roles, rejected/missing roles, and invalid/forged tokens at exercise endpoints.
+`KiloApiFactory` shares disposable Postgres setup between Me, exercise and routine feature tests; its subject/role headers are test-only and have no production authentication meaning. `ExercisesControllerTests` uses `ExerciseWriteRequestFaker` for global/custom CRUD, versioned Location links, fixed scope, isolation including admins, brand normalization/bounds, native validation, archived filtering and database constraints. Native Clerk tests also verify signed admin roles, rejected/missing roles, and invalid/forged tokens at exercise endpoints. `RoutinesControllerTests` and `RoutineWriteRequestFaker` cover routine CRUD, archives, validation and ownership query translation; signed-token tests verify routine ownership and private isolation from admins.
 
 `IntegrationTests/FoundationTests.cs` checks configuration, native HTTP/versioning/validation, scoped contexts, model-snapshot consistency, and bounded unavailable readiness. Its Postgres check starts its own Testcontainer and verifies migration replay, identity/defaults, rollback, cancellation, healthy readiness, and database constraints. Docker is required for the full suite; there is no external admin connection or silently skipped database check. The migrator subprocess has a 45-second deadline and is terminated if it exceeds that deadline.
 

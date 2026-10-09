@@ -5,6 +5,7 @@ using Kilo.Features.Me;
 using Kilo.Hosting;
 using Kilo.Persistence;
 using Kilo.Persistence.Entities;
+using Kilo.Persistence.Queries;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -77,7 +78,7 @@ public sealed class ExercisesController(KiloDbContext db, CurrentUser currentUse
         }
 
         var userId = await currentUser.GetIdAsync(cancellationToken);
-        var exercise = await db.Exercises.SingleOrDefaultAsync(x => x.Id == id && x.UserId == userId, cancellationToken);
+        var exercise = await db.Exercises.OwnedBy(userId).SingleOrDefaultAsync(x => x.Id == id, cancellationToken);
         if (exercise is null)
         {
             return await db.Exercises.AnyAsync(x => x.Id == id && x.UserId == null, cancellationToken)
