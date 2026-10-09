@@ -1,6 +1,6 @@
 # Kilo
 
-The current implementation covers slices 01-06 of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, separate EF migrator, release images, local Compose, Clerk identity/preferences, the global/private exercise library, and private routine templates. Verification is recorded in [slice 04](docs/slice-04-verification.md), [slice 05](docs/slice-05-verification.md), and [slice 06](docs/slice-06-verification.md). The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
+The current implementation covers slices 01-07 of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, separate EF migrator, release images, local Compose, Clerk identity/preferences, the global/private exercise library, private routines, and ordered exercise placements. Verification is recorded in [slice 04](docs/slice-04-verification.md), [slice 05](docs/slice-05-verification.md), [slice 06](docs/slice-06-verification.md), and [slice 07](docs/slice-07-verification.md). The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
 
@@ -12,7 +12,7 @@ Run the separate migrator to apply additive `20261008230628_AddExercises`; the A
 
 ## Private routines (slice 06)
 
-GET `/api/v1/routines` returns the caller's active templates ordered by name then ID; `?includeArchived=true` includes owned archives. POST creates a private routine and returns its versioned detail Location. GET/PUT `/api/v1/routines/{id}` reads/replaces owned metadata. Names are trimmed and required; omitted/null descriptions become empty strings. Detail/create/update return `exercises: []` until placements arrive in slice 07. Archived detail remains readable; archived updates return 409. Foreign/missing IDs return 404, including for admins. Requests cannot set owner or archive state.
+GET `/api/v1/routines` returns the caller's active templates ordered by name then ID; `?includeArchived=true` includes owned archives. POST creates a private routine and returns its versioned detail Location. GET/PUT `/api/v1/routines/{id}` reads/replaces owned metadata. Names are trimmed and required; omitted/null descriptions become empty strings. New routines start with `exercises: []`; detail and metadata updates return active placements ordered by position. Archived detail remains readable; archived updates return 409. Foreign/missing IDs return 404, including for admins. Requests cannot set owner or archive state.
 
 Apply additive `20261008234727_AddRoutines` through the separate migrator. [Slice-06 verification](docs/slice-06-verification.md) records **114 passing tests**, migration upgrade/replay, release-image and isolated Compose gates.
 
@@ -25,6 +25,20 @@ var routine = await db.Routines.OwnedBy(userId)
 ```
 
 Import `Kilo.Persistence.Queries`. `OwnedBy` requires an EF-mapped integer/nullable-integer `UserId` and a verified positive local user ID. It excludes null/global owners; apply it before materializing private queries, adding resource/nesting/archive predicates as needed. It does not resolve identity, set an owner on creation, or grant admin/global visibility. Shared exercise reads and native admin writes retain their explicit scope rules.
+
+## Ordered placements (slice 07)
+
+POST `/api/v1/routines/{routineId}/exercises` attaches an active global or caller-owned custom exercise:
+
+```json
+{ "exerciseId": 42, "position": 1, "description": "Pause at the bottom", "defaultRestSeconds": 120 }
+```
+
+PUT `/api/v1/routines/{routineId}/exercises/{placementId}` replaces `position`, `description`, and `defaultRestSeconds`. The library ID is immutable; repeated exercises get distinct placement IDs/instructions. Position and rest are required integers, position is positive, and rest can explicitly be zero. Omitted/null description clears to empty. Responses include current library name/brand and `sets: []` until slice 08. POST's 201 Location leads to the existing routine detail endpoint. No separate placement GET or bulk reorder/archive route is added.
+
+`RoutinePlacementService` owns one ReadCommitted transaction and locks the private routine before the library exercise on attachment. Owner/scope values come from verified identity and the selected row. Composite foreign keys/checks reject invalid cross-account references, including attempts to treat a private exercise as global. Missing/foreign/wrong-parent resources return 404; archived write targets and the named active-position collision return 409. Validation stays 422/400 before provisioning or writes. Other database failures remain sanitized errors.
+
+Run the separate migrator for additive `20261009002516_AddRoutineExercises`. It adds the computed internal library access key and placements, preserving earlier data/history. [Slice-07 verification](docs/slice-07-verification.md) records **149 passing tests**, seeded upgrades, deterministic lock-wait/cancellation checks, and release gates. Planned sets arrive in slice 08; archive/bulk reorder in slice 15.
 
 ## Release images (slice 02)
 

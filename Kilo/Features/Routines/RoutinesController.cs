@@ -35,9 +35,7 @@ public sealed class RoutinesController(KiloDbContext db, CurrentUser currentUser
     public async Task<ActionResult<RoutineDto>> Get(int id, CancellationToken cancellationToken = default)
     {
         var userId = await currentUser.GetIdAsync(cancellationToken);
-        var routine = await db.Routines.AsNoTracking().OwnedBy(userId)
-            .Where(x => x.Id == id)
-            .Select(x => new RoutineDto(x.Id, x.Name, x.Description, x.ArchivedAt))
+        var routine = await RoutineDto.Project(db.Routines.AsNoTracking().OwnedBy(userId).Where(x => x.Id == id))
             .SingleOrDefaultAsync(cancellationToken);
         return routine is null ? NotFound() : routine;
     }
@@ -90,6 +88,7 @@ public sealed class RoutinesController(KiloDbContext db, CurrentUser currentUser
         routine.Name = request.Name.Trim();
         routine.Description = request.Description ?? "";
         await db.SaveChangesAsync(cancellationToken);
-        return RoutineDto.From(routine);
+        return await RoutineDto.Project(db.Routines.AsNoTracking().OwnedBy(userId).Where(x => x.Id == id))
+            .SingleAsync(cancellationToken);
     }
 }

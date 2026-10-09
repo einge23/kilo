@@ -39,7 +39,7 @@ public sealed class RoutinesControllerTests(KiloApiFactory factory) : IClassFixt
         Assert.Equal($"{Route}/{dto.Id}", response.Headers.Location!.AbsolutePath);
         using var detail = await client.GetAsync(response.Headers.Location);
         Assert.Equal(HttpStatusCode.OK, detail.StatusCode);
-        Assert.Equal(dto, await ReadRoutine(detail));
+        Assert.Equivalent(dto, await ReadRoutine(detail), strict: true);
 
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
@@ -98,7 +98,7 @@ public sealed class RoutinesControllerTests(KiloApiFactory factory) : IClassFixt
         Assert.Equal("Updated", updated.Name);
         Assert.Equal(description ?? "", updated.Description);
         using var detail = await client.GetAsync($"{Route}/{original.Id}");
-        Assert.Equal(updated, await ReadRoutine(detail));
+        Assert.Equivalent(updated, await ReadRoutine(detail), strict: true);
         var after = await db.Routines.AsNoTracking().SingleAsync(x => x.Id == original.Id);
         Assert.Equal(before.UserId, after.UserId);
         Assert.Equal(before.CreatedAt, after.CreatedAt);
@@ -126,7 +126,7 @@ public sealed class RoutinesControllerTests(KiloApiFactory factory) : IClassFixt
             }
         }
         using var saved = await owner.GetAsync($"{Route}/{routine.Id}");
-        Assert.Equal(routine, await ReadRoutine(saved));
+        Assert.Equivalent(routine, await ReadRoutine(saved), strict: true);
     }
 
     [Fact]
@@ -172,7 +172,7 @@ public sealed class RoutinesControllerTests(KiloApiFactory factory) : IClassFixt
         Assert.Equal(HttpStatusCode.Conflict, update.StatusCode);
         Assert.Equal(409, (await update.Content.ReadFromJsonAsync<ProblemDetails>())!.Status);
         using var unchanged = await client.GetAsync($"{Route}/{routine.Id}");
-        Assert.Equal(archived, await ReadRoutine(unchanged));
+        Assert.Equivalent(archived, await ReadRoutine(unchanged), strict: true);
     }
 
     [Theory]
@@ -198,7 +198,7 @@ public sealed class RoutinesControllerTests(KiloApiFactory factory) : IClassFixt
         using var put = await client.PutAsync($"{Route}/{original.Id}", new StringContent(json, Encoding.UTF8, "application/json"));
         await AssertValidation(put, status);
         using var unchanged = await client.GetAsync($"{Route}/{original.Id}");
-        Assert.Equal(original, await ReadRoutine(unchanged));
+        Assert.Equivalent(original, await ReadRoutine(unchanged), strict: true);
         var userId = await db.Users.Where(x => x.ClerkUserId == subject).Select(x => x.Id).SingleAsync();
         Assert.Single(await db.Routines.OwnedBy(userId).ToArrayAsync());
     }

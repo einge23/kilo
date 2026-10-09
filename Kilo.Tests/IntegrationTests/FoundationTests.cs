@@ -89,6 +89,7 @@ public sealed class FoundationTests
     [Theory]
     [InlineData("OrganizeUserEntity")]
     [InlineData("AddExercises")]
+    [InlineData("AddRoutines")]
     public async Task Ef_migrations_repeat_and_transactions_roll_back_failures_and_cancellation(string baseline)
     {
         await using var postgres = new PostgreSqlBuilder("postgres:18.6-alpine")
@@ -102,32 +103,47 @@ public sealed class FoundationTests
             Timeout = 5
         }.ConnectionString;
         Exercise[] upgradeExercises = [];
+        Routine? upgradeRoutine = null;
         await using (var previous = CreateContext(connectionString))
         {
             var previousMigration = previous.Database.GetMigrations().Single(id => id.EndsWith("_" + baseline, StringComparison.Ordinal));
             await previous.GetService<IMigrator>().MigrateAsync(previousMigration, timeout.Token);
             Assert.DoesNotContain(await previous.Database.GetAppliedMigrationsAsync(timeout.Token),
-                id => id.EndsWith("_AddRoutines", StringComparison.Ordinal));
+                id => id.EndsWith("_AddRoutineExercises", StringComparison.Ordinal));
             var upgradeUser = new User
             {
                 ClerkUserId = "upgrade_fixture", TimeZone = "America/Phoenix", MeasurementSystem = "metric"
             };
             previous.Users.Add(upgradeUser);
             await previous.SaveChangesAsync(timeout.Token);
-            if (baseline == "AddExercises")
+            if (baseline is "AddExercises" or "AddRoutines")
             {
                 upgradeExercises =
                 [
                     new Exercise { Name = "Retained global", BrandName = "ACME", Description = "Global metadata" },
                     new Exercise { UserId = upgradeUser.Id, Name = "Retained custom", Description = "Private metadata", ArchivedAt = DateTime.UtcNow }
                 ];
-                previous.Exercises.AddRange(upgradeExercises);
-                await previous.SaveChangesAsync(timeout.Token);
                 foreach (var exercise in upgradeExercises)
                 {
-                    // Capture the stored PostgreSQL microsecond precision before the upgrade.
-                    await previous.Entry(exercise).ReloadAsync(timeout.Token);
+                    // Seed the actual old schema: it does not have the current EF access-key column yet.
+                    await previous.Database.ExecuteSqlInterpolatedAsync($"""
+                        INSERT INTO public.exercises (user_id, name, description, brand_name, archived_at)
+                        VALUES ({exercise.UserId}, {exercise.Name}, {exercise.Description}, {exercise.BrandName}, {exercise.ArchivedAt})
+                        """, timeout.Token);
+                    var stored = await previous.Exercises.FromSqlInterpolated($"""
+                        SELECT *, coalesce(user_id, 0) AS access_scope_id FROM public.exercises WHERE name = {exercise.Name}
+                        """).AsNoTracking().SingleAsync(timeout.Token);
+                    exercise.Id = stored.Id;
+                    exercise.ArchivedAt = stored.ArchivedAt;
+                    exercise.CreatedAt = stored.CreatedAt;
                 }
+            }
+            if (baseline == "AddRoutines")
+            {
+                upgradeRoutine = new Routine { UserId = upgradeUser.Id, Name = "Retained routine", Description = "Template metadata", ArchivedAt = DateTime.UtcNow };
+                previous.Routines.Add(upgradeRoutine);
+                await previous.SaveChangesAsync(timeout.Token);
+                await previous.Entry(upgradeRoutine).ReloadAsync(timeout.Token);
             }
         }
         var first = await RunMigrator(connectionString);
@@ -150,6 +166,14 @@ public sealed class FoundationTests
         await db.SaveChangesAsync();
         Assert.True(routine.Id > 0);
         Assert.Equal(DateTimeKind.Utc, routine.CreatedAt.Kind);
+        var replayExercise = new Exercise { Name = "Replay exercise" };
+        var replayPlacement = new RoutineExercise
+        {
+            UserId = fixture.Id, RoutineId = routine.Id, Exercise = replayExercise,
+            Position = 1, Description = "Placement metadata", DefaultRestSeconds = 0
+        };
+        db.RoutineExercises.Add(replayPlacement);
+        await db.SaveChangesAsync();
         var second = await RunMigrator(connectionString);
         Assert.True(second.ExitCode == 0, second.Output);
         Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
@@ -173,7 +197,25 @@ public sealed class FoundationTests
             Assert.Equal(original.BrandName, saved.BrandName);
             Assert.Equal(original.ArchivedAt, saved.ArchivedAt);
             Assert.Equal(original.CreatedAt, saved.CreatedAt);
+            Assert.Equal(original.UserId ?? 0, await db.Exercises.Where(x => x.Id == original.Id)
+                .Select(x => EF.Property<int>(x, "AccessScopeId")).SingleAsync());
         }
+        if (upgradeRoutine is not null)
+        {
+            var saved = await db.Routines.AsNoTracking().SingleAsync(x => x.Id == upgradeRoutine.Id);
+            Assert.Equal(upgradeRoutine.Name, saved.Name);
+            Assert.Equal(upgradeRoutine.Description, saved.Description);
+            Assert.Equal(upgradeRoutine.UserId, saved.UserId);
+            Assert.Equal(upgradeRoutine.ArchivedAt, saved.ArchivedAt);
+            Assert.Equal(upgradeRoutine.CreatedAt, saved.CreatedAt);
+        }
+        var retainedPlacement = await db.RoutineExercises.AsNoTracking().SingleAsync(x => x.Id == replayPlacement.Id);
+        Assert.Equal(replayPlacement.ExerciseId, retainedPlacement.ExerciseId);
+        Assert.Equal(replayPlacement.UserId, retainedPlacement.UserId);
+        Assert.Equal(replayPlacement.RoutineId, retainedPlacement.RoutineId);
+        Assert.Equal(0, retainedPlacement.ExerciseScopeId);
+        Assert.Equal(0, retainedPlacement.DefaultRestSeconds);
+        Assert.Equal(replayPlacement.Description, retainedPlacement.Description);
 
         await using (var write = CreateContext(connectionString))
         await using (var transaction = await write.Database.BeginTransactionAsync())

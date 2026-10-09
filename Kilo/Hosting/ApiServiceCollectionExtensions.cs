@@ -1,6 +1,7 @@
 using Asp.Versioning;
 using FluentValidation;
 using Kilo.Features.Me;
+using Kilo.Features.Routines;
 
 namespace Kilo.Hosting;
 
@@ -24,6 +25,7 @@ public static class ApiServiceCollectionExtensions
         }).AddMvc();
         services.AddHttpContextAccessor();
         services.AddScoped<CurrentUser>();
+        services.AddScoped<RoutinePlacementService>();
         return services;
     }
 }

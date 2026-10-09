@@ -8,4 +8,5 @@ public sealed class Routine
     public string Description { get; set; } = "";
     public DateTime? ArchivedAt { get; set; }
     public DateTime CreatedAt { get; set; }
+    public ICollection<RoutineExercise> Exercises { get; } = [];
 }

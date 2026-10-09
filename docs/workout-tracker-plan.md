@@ -860,15 +860,15 @@ The extension is a query predicate, not automatic authorization. Do not use it o
 
 ## Already exists
 
-Global/private exercises and owned routines. Generate AddRoutineExercises with the derived library access key, composite foreign keys/checks, and an active-position unique index. Extend routine details to read ordered placements.
+Global/private exercises, owned routines, OwnedBy queries, validator DI and KiloApiFactory. Generate AddRoutineExercises with the derived library access key, composite FKs/checks and active-position uniqueness. Keep applied migrations intact.
 
 ## Add and implement
 
-1. Add POST/PUT nested placement actions to the routine feature. Use route name placementId instead of ambiguous exerciseId; the wire path shape stays compatible. Body exerciseId is the library exercise ID.
-2. Create distinct placement IDs, allowing the same library exercise more than once. Store position>0, placement-specific description, and defaultRestSeconds>=0. Existing placement exerciseId is immutable; replacement will archive and create a new placement.
-3. For each placement write, begin an explicit EF ReadCommitted transaction. Lock the owned routine first, then the visible global or caller-owned library exercise when attaching. Require both active. Store ExerciseScopeId from the selected row (UserId ?? 0), never the request; the scope FK/check prevents cross-user references. Nested update must prove Placement.RoutineId equals the route routineId and UserId equals the caller.
-4. Return current library exercise name/brand through the routine detail join; store no placement brand column. Sets remain [] until 08.
-5. Use the same scoped context, transaction, and token for every operation. Translate only DbUpdateException wrapping the named active-position unique violation to 409; unrelated database faults remain errors.
+1. Add RoutinePlacementsController POST/PUT actions. Route placementId names the placement; body exerciseId names the library entry. PlacementCreateRequest and PlacementUpdateRequest have DI-discovered validators. Required numeric inputs are nullable: missing/rule failures return 422 before provisioning; malformed/type-binding failures stay 400.
+2. Create distinct placement IDs, allowing repeated library exercises. Store positive position, independent description and required nonnegative defaultRestSeconds; explicit zero remains zero. Omitted/null description clears to empty. PUT cannot change exerciseId, owner or scope.
+3. Scoped RoutinePlacementService owns one ReadCommitted transaction. Lock the owned routine first, then the global/own exercise when attaching; require active targets. Assign ExerciseScopeId = selected.UserId ?? 0. Updates use OwnedBy and match both placementId and route routineId. Composite FKs/checks enforce access again in PostgreSQL.
+4. Project RoutineDto.Exercises as ordered active RoutineExerciseDto[]. Join current library name/brand, keep sets=[] until 08, and preserve placements in routine metadata PUT responses. POST returns 201 with a versioned Location to the existing routine detail GET; no new read route.
+5. Pass the same context/transaction/token throughout. Translate only the named routine_exercises_active_position unique violation to 409; rollback rejected writes, and leave unrelated faults as sanitized errors. Archive/bulk reorder routes remain slice 15.
 
 ## Transaction shape - partial workflow
 
@@ -895,11 +895,12 @@ Lock ordering starts here: routine parent before library exercise; all code that
 ## Gate
 
 - Add positions 1-3 and verify ascending detail order. Give repeated Bench Press placements distinct instructions and IDs.
-- Reject nonpositive/fractional positions, negative/noninteger rest, and duplicate active positions. A unique collision is 409; request-rule validation is 422 and fractional/noninteger binding is 400.
+- Reject omitted/null/nonpositive positions, omitted/null/negative rest, and invalid integer binding. Explicit zero rest persists. Request rules return 422; malformed/fractional/overflow binding returns 400 without provisioning or mutation.
 - Attach global and own custom entries successfully. Foreign custom/routine or wrong-parent IDs return 404. Direct invalid scope/owner inserts fail database constraints.
-- Attach an archived global/own custom exercise or edit an archived routine; return 409. The lock/state check must not only rely on a stale read.
-- Change a library brand; both repeated routine placements show the current brand, without writing the placement rows.
-- Race two inserts at one position; one commits and one returns 409, with no partial work.
+- Attach an archived global/own exercise or edit an archived routine/placement; return 409. Observe actual PostgreSQL lock waits, commit archive state, then verify rejection. Cancellation releases the routine lock without a placement.
+- Change a library brand/name; repeated placements show current values without placement writes. Routine metadata PUT retains the ordered collection. Owner/scope/library-ID injection cannot change server values; signed admins remain private.
+- Race same-position inserts: one 201, one 409. Collision updates roll back metadata too; archived positions can be reused. Unrelated database faults stay sanitized 500.
+- Verify fresh migrations and seeded pre-exercise, slice-05 and slice-06 upgrades/replay; retain users, exercises, routines and placements. Check generated-key backfill and no pending model changes.
 
 ## Acceptance
 
@@ -908,6 +909,8 @@ Lock ordering starts here: routine parent before library exercise; all code that
 ## Carry forward
 
 Template child writes lock the routine parent. This makes reorder and archive atomic later. Snapshot creation will use RepeatableRead so multi-query copies see one committed template state.
+
+The October 8 gate passed 149 tests, three seeded upgrade baselines, five compiled EF migrations, Linux images and isolated Compose. See docs/slice-07-verification.md. Slice 08 is next; no sets or archive/reorder endpoints are implemented here.
 
 @progress 07
 
@@ -1405,17 +1408,15 @@ Run against the Linux host through HTTPS. Retain evidence before marking the app
 
 ## Current implementation and evidence
 
-The repository implements slices 01-03 with EF persistence and a separate MigrateAsync executable. The transition verification record and slice-02/03 records contain the actual build, real-Postgres, image, and Compose checks. PDF regeneration does not prove a feature gate passed.
+Slices 01-07 are implemented: EF foundation and separate migrator, release images/Compose, Clerk profiles, global/private exercises, private routines and ordered placements. Slices 08-20 remain planned; later SQL contracts do not authorize early tables. PDF regeneration alone proves no feature gate.
 
-Slice 04 implements Clerk identity, local profiles and preferences; its original gate passed with 35 tests (docs/slice-04-verification.md). Slice 05 adds global/private exercises and native admin policies. Its gate passed with 72 tests, seeded EF upgrade/replay and refreshed image/Compose checks (docs/slice-05-verification.md). Slices 07-20 remain planned. SQL contracts describe future mappings, not authorization to generate all tables now.
+Original slice-04/05/06 gates passed 35/72/114 tests respectively; see docs/slice-04-verification.md, docs/slice-05-verification.md and docs/slice-06-verification.md. The FluentValidation/422 revision passed 89 tests (docs/request-validation-verification.md). Earlier records retain their historical behavior/evidence.
 
-Request validation now uses automatically registered FluentValidation validators and standardized 422 errors. The follow-up verification passed 89 tests with no skips; see docs/request-validation-verification.md. Earlier slice records retain their original evidence and validation policy.
+Slice 07 passed 149 tests, three seeded upgrade baselines, five compiled migrations, Linux images and isolated Compose. Ownership constraints, ordered projections, lock-wait/cancellation and named conflicts are verified; see docs/slice-07-verification.md. EF reports no pending model changes.
 
-Slice 06 adds private routine metadata and the reusable OwnedBy query filter. Its gate passed with 114 tests, seeded upgrades, four compiled EF migrations, Linux images and isolated Compose; see docs/slice-06-verification.md.
+## Continue with 08 when requested
 
-## Continue with 07 when requested
-
-Retain scoped EF, native migration history, slim startup, async validators, OwnedBy predicates and shared KiloApiFactory. Routine templates stay private; placement/snapshot access keys arrive in 07/10 and archive writes in 15. Configure the real Clerk role/session claim as documented. No future feature scaffolding is needed.
+Retain scoped EF, native history, slim startup, async validators, OwnedBy and KiloApiFactory. Slice 08 adds planned sets under the verified routine/placement chain and the same routine lock. Preserve complete weight value/unit pairs, optional rest overrides and required nullable numeric inputs. Archive/bulk reorder remains 15; snapshot copying remains 10. Configure the real Clerk role/session claim as documented.
 
 ---page---
 # API reference - route catalog
@@ -1712,7 +1713,7 @@ Do this in 07, when the first child reference exists; copy the validated key int
 ```sql
 CREATE TABLE routine_exercises (
     id                      integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    user_id                 integer NOT NULL REFERENCES users(id),
+    user_id                 integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     routine_id              integer NOT NULL,
     exercise_id             integer NOT NULL,
     exercise_scope_id       integer NOT NULL,
@@ -1723,15 +1724,17 @@ CREATE TABLE routine_exercises (
     archived_at             timestamptz,
     UNIQUE (id, user_id),
     FOREIGN KEY (routine_id, user_id)
-        REFERENCES routines(id, user_id),
+        REFERENCES routines(id, user_id) ON DELETE RESTRICT,
     CHECK (exercise_scope_id = 0 OR exercise_scope_id = user_id),
     FOREIGN KEY (exercise_id, exercise_scope_id)
-        REFERENCES exercises(id, access_scope_id)
+        REFERENCES exercises(id, access_scope_id) ON DELETE RESTRICT
 );
 CREATE UNIQUE INDEX routine_exercises_active_position
     ON routine_exercises(routine_id, position)
     WHERE archived_at IS NULL;
 ```
+
+DefaultRestSeconds is required in API requests; the SQL default is only a database fallback. Configure HasDefaultValue(120).ValueGeneratedNever() so EF sends explicit zero rather than treating it as an unset value. Initialize the entity's default to 120. Keep description empty and the new placement active unless a later authorized archive changes it.
 
 
 ---page---

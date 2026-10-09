@@ -3,6 +3,7 @@ using System;
 using Kilo.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Kilo.Persistence.Migrations
 {
     [DbContext(typeof(KiloDbContext))]
-    partial class KiloDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261009002516_AddRoutineExercises")]
+    partial class AddRoutineExercises
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
