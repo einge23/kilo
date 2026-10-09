@@ -102,6 +102,8 @@ try {
     $containers += $apiName
     Invoke-Docker run -d --name $apiName --platform $Platform --publish '127.0.0.1::8080' `
         --env DOTNET_ENVIRONMENT=Production `
+        --env 'Clerk__Issuer=https://clerk.kilo.test' `
+        --env 'Clerk__AuthorizedParties__0=https://frontend.kilo.test' `
         --env 'ConnectionStrings__Postgres=Host=127.0.0.1;Port=1;Database=kilo;Username=test;Timeout=1;GSS Encryption Mode=Disable' `
         $images[0] | Out-Null
     $api = (Invoke-Docker inspect $apiName | ConvertFrom-Json)[0]
@@ -119,7 +121,8 @@ try {
         }
         Assert-Check $ready 'API did not bind to port 8080 with environment-only configuration.'
         $openApi = $http.GetAsync("http://127.0.0.1:$port/openapi/v1.json").GetAwaiter().GetResult()
-        Assert-Check ([int] $openApi.StatusCode -eq 404) 'Production exposes OpenAPI.'
+        Assert-Check ([int] $openApi.StatusCode -eq 401) 'Production fallback authorization did not protect the unmatched route.'
+        # The native JWT integration gate independently asserts authenticated 404 here.
     } finally { $http.Dispose() }
     Invoke-Docker stop --signal SIGTERM -t 10 $apiName | Out-Null
     $stopped = (Invoke-Docker inspect $apiName | ConvertFrom-Json)[0]

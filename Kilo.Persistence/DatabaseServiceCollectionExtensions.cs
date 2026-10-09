@@ -19,12 +19,24 @@ public static class DatabaseServiceCollectionExtensions
     {
         var connection = configuration.GetConnectionString("Postgres");
         if (string.IsNullOrWhiteSpace(connection))
+        {
             throw new InvalidOperationException("ConnectionStrings:Postgres is required.");
+        }
+
         NpgsqlConnectionStringBuilder settings;
-        try { settings = new NpgsqlConnectionStringBuilder(connection); }
-        catch (ArgumentException) { throw new InvalidOperationException("ConnectionStrings:Postgres is invalid."); }
+        try
+        {
+            settings = new NpgsqlConnectionStringBuilder(connection);
+        }
+        catch (ArgumentException)
+        {
+            throw new InvalidOperationException("ConnectionStrings:Postgres is invalid.");
+        }
         if (string.IsNullOrWhiteSpace(settings.Host) || string.IsNullOrWhiteSpace(settings.Database))
+        {
             throw new InvalidOperationException("Postgres Host and Database are required.");
+        }
+
         return connection;
     }
 }

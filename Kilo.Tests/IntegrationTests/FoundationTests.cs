@@ -5,17 +5,22 @@ using System.Net.Http.Json;
 using Asp.Versioning;
 using Kilo.Persistence;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Kilo.Hosting;
 using Kilo.Persistence.Entities;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
+using Testcontainers.PostgreSql;
 using Xunit;
 
-namespace Kilo.Tests;
+namespace Kilo.Tests.IntegrationTests;
 
 public sealed class FoundationTests
 {
@@ -81,95 +86,87 @@ public sealed class FoundationTests
         Assert.Contains("ConnectionStrings:Postgres is required.", result.Output);
     }
 
-    [PostgresFact]
+    [Fact]
     public async Task Ef_migrations_repeat_and_transactions_roll_back_failures_and_cancellation()
     {
-        await WithDatabase(async connectionString =>
+        await using var postgres = new PostgreSqlBuilder("postgres:18.6-alpine")
+            .WithDatabase("kilo_foundation_" + Guid.NewGuid().ToString("N"))
+            .WithPassword(Guid.NewGuid().ToString("N")).Build();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        await postgres.StartAsync(timeout.Token);
+        var connectionString = new NpgsqlConnectionStringBuilder(postgres.GetConnectionString())
         {
-            var first = await RunMigrator(connectionString);
-            Assert.True(first.ExitCode == 0, first.Output);
-            await using var db = CreateContext(connectionString);
-            Assert.False(db.Database.HasPendingModelChanges());
-            var fixture = new User { ClerkUserId = "fixture" };
-            db.Users.Add(fixture);
-            await db.SaveChangesAsync();
-            Assert.True(fixture.Id > 0);
-            Assert.Equal("UTC", fixture.TimeZone);
-            Assert.Equal("imperial", fixture.MeasurementSystem);
-            Assert.Equal(DateTimeKind.Utc, fixture.CreatedAt.Kind);
-            var migrations = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
-            Assert.Equal(db.Database.GetMigrations(), migrations);
-            fixture.TimeZone = "America/Phoenix";
-            Validator.ValidateObject(fixture, new ValidationContext(fixture), validateAllProperties: true);
-            await db.SaveChangesAsync();
-            var second = await RunMigrator(connectionString);
-            Assert.True(second.ExitCode == 0, second.Output);
-            Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
-            var retained = await db.Users.AsNoTracking().SingleAsync();
-            Assert.Equal(fixture.Id, retained.Id);
-            Assert.Equal("America/Phoenix", retained.TimeZone);
+            GssEncryptionMode = GssEncryptionMode.Disable,
+            Timeout = 5
+        }.ConnectionString;
+        var first = await RunMigrator(connectionString);
+        Assert.True(first.ExitCode == 0, first.Output);
+        await using var db = CreateContext(connectionString);
+        Assert.False(db.Database.HasPendingModelChanges());
+        var fixture = new User { ClerkUserId = "fixture" };
+        db.Users.Add(fixture);
+        await db.SaveChangesAsync();
+        Assert.True(fixture.Id > 0);
+        Assert.Equal("UTC", fixture.TimeZone);
+        Assert.Equal("imperial", fixture.MeasurementSystem);
+        Assert.Equal(DateTimeKind.Utc, fixture.CreatedAt.Kind);
+        var migrations = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
+        Assert.Equal(db.Database.GetMigrations(), migrations);
+        fixture.TimeZone = "America/Phoenix";
+        Validator.ValidateObject(fixture, new ValidationContext(fixture), validateAllProperties: true);
+        await db.SaveChangesAsync();
+        var second = await RunMigrator(connectionString);
+        Assert.True(second.ExitCode == 0, second.Output);
+        Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
+        var retained = await db.Users.AsNoTracking().SingleAsync(user => user.ClerkUserId == "fixture");
+        Assert.Equal(fixture.Id, retained.Id);
+        Assert.Equal("America/Phoenix", retained.TimeZone);
 
-            await using (var write = CreateContext(connectionString))
-            await using (var transaction = await write.Database.BeginTransactionAsync())
-            {
-                write.Users.Add(new User { ClerkUserId = "rollback" });
-                await write.SaveChangesAsync();
-                await Assert.ThrowsAsync<PostgresException>(() =>
-                    write.Database.ExecuteSqlRawAsync("SELECT 1 / 0"));
-            }
-            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "rollback"));
+        await using (var write = CreateContext(connectionString))
+        await using (var transaction = await write.Database.BeginTransactionAsync())
+        {
+            write.Users.Add(new User { ClerkUserId = "rollback" });
+            await write.SaveChangesAsync();
+            await Assert.ThrowsAsync<PostgresException>(() =>
+                write.Database.ExecuteSqlRawAsync("SELECT 1 / 0"));
+        }
+        Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "rollback"));
 
-            await using (var write = CreateContext(connectionString))
-            await using (var transaction = await write.Database.BeginTransactionAsync())
-            {
-                write.Users.Add(new User { ClerkUserId = "cancelled" });
-                await write.SaveChangesAsync();
-                using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-                    write.Database.ExecuteSqlRawAsync("SELECT pg_sleep(10)", deadline.Token));
-            }
-            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "cancelled"));
-            await using (var invalid = CreateContext(connectionString))
-            {
-                invalid.Users.Add(new User { ClerkUserId = "invalid", MeasurementSystem = "unknown" });
-                await Assert.ThrowsAsync<DbUpdateException>(() => invalid.SaveChangesAsync());
-            }
-            Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "invalid"));
-            await using var factory = CreateApi(connectionString);
-            using var client = factory.CreateClient();
-            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/health")).StatusCode);
-        });
+        await using (var write = CreateContext(connectionString))
+        await using (var transaction = await write.Database.BeginTransactionAsync())
+        {
+            write.Users.Add(new User { ClerkUserId = "cancelled" });
+            await write.SaveChangesAsync();
+            using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                write.Database.ExecuteSqlRawAsync("SELECT pg_sleep(10)", deadline.Token));
+        }
+        Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "cancelled"));
+        await using (var invalid = CreateContext(connectionString))
+        {
+            invalid.Users.Add(new User { ClerkUserId = "invalid", MeasurementSystem = "unknown" });
+            await Assert.ThrowsAsync<DbUpdateException>(() => invalid.SaveChangesAsync());
+        }
+        Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == "invalid"));
+        await using var factory = CreateApi(connectionString);
+        using var client = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/health")).StatusCode);
     }
 
     private static KiloDbContext CreateContext(string connectionString) => new(
         new DbContextOptionsBuilder<KiloDbContext>().UseNpgsql(connectionString,
             postgres => postgres.CommandTimeout(15).MigrationsHistoryTable("__EFMigrationsHistory", "public")).Options);
 
-    private static async Task WithDatabase(Func<string, Task> check)
-    {
-        var adminSettings = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("KILO_TEST_POSTGRES"));
-        var database = "kilo_test_" + Guid.NewGuid().ToString("N");
-        await using var admin = new NpgsqlConnection(adminSettings.ConnectionString);
-        await admin.OpenAsync();
-        await using (var command = new NpgsqlCommand($"CREATE DATABASE {database}", admin) { CommandTimeout = 15 })
-            await command.ExecuteNonQueryAsync();
-        try
-        {
-            var settings = new NpgsqlConnectionStringBuilder(adminSettings.ConnectionString) { Database = database };
-            await check(settings.ConnectionString);
-        }
-        finally
-        {
-            await using var command = new NpgsqlCommand($"DROP DATABASE {database} WITH (FORCE)", admin) { CommandTimeout = 15 };
-            await command.ExecuteNonQueryAsync();
-        }
-    }
-
     private static WebApplicationFactory<Program> CreateApi(string connectionString) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Development");
             builder.UseSetting("ConnectionStrings:Postgres", connectionString);
+            builder.UseSetting("Clerk:Issuer", "https://clerk.kilo.test");
+            builder.UseSetting("Clerk:AuthorizedParties:0", "https://frontend.kilo.test");
+            // Foundation checks isolate routing; Me tests exercise protected requests.
+            builder.ConfigureTestServices(services =>
+                services.PostConfigure<AuthorizationOptions>(options => options.FallbackPolicy = null));
             builder.ConfigureServices(services =>
                 services.AddControllers().AddApplicationPart(typeof(ProbeController).Assembly));
         });
@@ -196,22 +193,27 @@ public sealed class FoundationTests
         using var process = Process.Start(start)!;
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        try
+        {
+            await process.WaitForExitAsync(deadline.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            await process.WaitForExitAsync();
+            throw new TimeoutException("The test migrator exceeded its 45-second deadline.");
+        }
         return (process.ExitCode, await output + await error);
-    }
-}
-
-public sealed class PostgresFactAttribute : FactAttribute
-{
-    public PostgresFactAttribute()
-    {
-        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("KILO_TEST_POSTGRES")))
-            Skip = "Set KILO_TEST_POSTGRES to a Postgres admin connection with CREATE DATABASE permission.";
     }
 }
 
 // Discovered only through the test assembly; never deployed with the API.
 [ApiController]
+[AllowAnonymous]
 [ApiVersion(1.0)]
 [Route("api/v{version:apiVersion}/probe")]
 public sealed class ProbeController : ControllerBase

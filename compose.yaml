@@ -6,6 +6,8 @@ services:
       dockerfile: Kilo/Dockerfile
     environment:
       ConnectionStrings__Postgres: "Host=db;Database=kilo;Username=postgres;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env};Timeout=3;Command Timeout=15;GSS Encryption Mode=Disable"
+      Clerk__Issuer: "${CLERK_ISSUER:?Set CLERK_ISSUER in .env}"
+      Clerk__AuthorizedParties__0: "${CLERK_AUTHORIZED_PARTY:?Set CLERK_AUTHORIZED_PARTY in .env}"
       ASPNETCORE_HTTP_PORTS: 8080
     depends_on:
       migrations:

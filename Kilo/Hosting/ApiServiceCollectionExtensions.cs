@@ -1,4 +1,6 @@
 using Asp.Versioning;
+using FluentValidation;
+using Kilo.Features.Me;
 
 namespace Kilo.Hosting;
 
@@ -7,7 +9,9 @@ public static class ApiServiceCollectionExtensions
     public static IServiceCollection AddKiloApi(
         this IServiceCollection services)
     {
-        services.AddControllers();
+        services.AddControllers(options =>
+            options.SuppressImplicitRequiredAttributeForNonNullableReferenceTypes = true);
+        services.AddValidatorsFromAssemblyContaining<Program>();
         services.AddProblemDetails();
         services.AddOpenApi();
         services.AddSingleton<TimeProvider>(TimeProvider.System);
@@ -18,6 +22,8 @@ public static class ApiServiceCollectionExtensions
             options.ReportApiVersions = true;
             options.ApiVersionReader = new UrlSegmentApiVersionReader();
         }).AddMvc();
+        services.AddHttpContextAccessor();
+        services.AddScoped<CurrentUser>();
         return services;
     }
 }

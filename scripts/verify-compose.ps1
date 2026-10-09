@@ -13,6 +13,8 @@ $context = Join-Path $work 'context'
 $apiImage = "${project}:api"
 $migrationImage = "${project}:migrations"
 $previousPassword = $env:POSTGRES_PASSWORD
+$previousIssuer = $env:CLERK_ISSUER
+$previousParty = $env:CLERK_AUTHORIZED_PARTY
 $password = [guid]::NewGuid().ToString('N')
 $composeArgs = @()
 
@@ -96,6 +98,8 @@ services:
     $common = @('compose', '--project-name', $project, '--env-file', $emptyEnv)
     $composeArgs = $common + @('-f', $baseFile, '-f', $devFile, '-f', $overrideFile)
     $env:POSTGRES_PASSWORD = $password
+    $env:CLERK_ISSUER = 'https://clerk.kilo.test'
+    $env:CLERK_AUTHORIZED_PARTY = 'https://frontend.kilo.test'
 
     # Inspect the actual base/development files before replacing fixed ports for isolation.
     $base = (Invoke-Docker @common -f $baseFile config --format json | ConvertFrom-Json)
@@ -107,6 +111,8 @@ services:
         $connection = $service.environment.ConnectionStrings__Postgres
         Assert-Check ($connection.Contains("Password=$password;") -and $connection.Contains('Host=db;Database=kilo;')) 'Container connection configuration is incorrect.'
     }
+    Assert-Check ($base.services.api.environment.Clerk__Issuer -eq $env:CLERK_ISSUER -and
+        $base.services.api.environment.Clerk__AuthorizedParties__0 -eq $env:CLERK_AUTHORIZED_PARTY) 'Clerk configuration was not passed to the API.'
     $development = (Invoke-Docker @common -f $baseFile -f $devFile config --format json | ConvertFrom-Json)
     Assert-Check ($development.services.api.ports[0].published -eq '8080' -and
         $development.services.db.ports[0].published -eq '5432') 'Development ports changed unexpectedly.'
@@ -223,6 +229,8 @@ public sealed class ComposeGate : Migration
         }
     } finally {
         $env:POSTGRES_PASSWORD = $previousPassword
+        $env:CLERK_ISSUER = $previousIssuer
+        $env:CLERK_AUTHORIZED_PARTY = $previousParty
         foreach ($name in @('context', 'check.yaml', 'empty.env')) {
             $target = [IO.Path]::GetFullPath((Join-Path $work $name))
             $boundary = [IO.Path]::GetFullPath($work) + [IO.Path]::DirectorySeparatorChar
