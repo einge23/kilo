@@ -17,6 +17,29 @@ namespace Kilo.Tests.IntegrationTests;
 public sealed class ClerkAuthenticationTests(ClerkApiFactory factory) : IClassFixture<ClerkApiFactory>
 {
     [Theory]
+    [InlineData("admin", HttpStatusCode.Created)]
+    [InlineData("user", HttpStatusCode.Forbidden)]
+    [InlineData(null, HttpStatusCode.Forbidden)]
+    [InlineData("Admin", HttpStatusCode.Forbidden)]
+    public async Task Global_creation_requires_the_signed_admin_role(string? role, HttpStatusCode expected)
+    {
+        var name = NewSubject();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", factory.Token(NewSubject(), role: role));
+        client.DefaultRequestHeaders.Add("X-Role", "admin");
+        using var response = await client.PostAsJsonAsync("/api/v1/admin/exercises", new
+        {
+            name, role = "admin", isGlobal = true, userId = 1
+        });
+        Assert.Equal(expected, response.StatusCode);
+        using var update = await client.PutAsJsonAsync("/api/v1/admin/exercises/2147483647", new { name = "Signed role update" });
+        Assert.Equal(role == "admin" ? HttpStatusCode.NotFound : HttpStatusCode.Forbidden, update.StatusCode);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
+        Assert.Equal(expected == HttpStatusCode.Created ? 1 : 0, await db.Exercises.CountAsync(x => x.Name == name));
+    }
+
+    [Theory]
     [InlineData("missing")]
     [InlineData("expired")]
     [InlineData("tampered")]
@@ -44,9 +67,17 @@ public sealed class ClerkAuthenticationTests(ClerkApiFactory factory) : IClassFi
         using var response = await client.GetAsync("/api/v1/me");
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         Assert.Equal(401, (await response.Content.ReadFromJsonAsync<ProblemDetails>())!.Status);
+        client.DefaultRequestHeaders.Add(KiloApiFactory.RoleHeader, "admin");
+        using var deniedAdmin = await client.PostAsJsonAsync("/api/v1/admin/exercises", new { name = subject, role = "admin" });
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedAdmin.StatusCode);
+        using var deniedRead = await client.GetAsync("/api/v1/exercises");
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedRead.StatusCode);
+        using var deniedCustom = await client.PostAsJsonAsync("/api/v1/exercises", new { name = subject, role = "admin" });
+        Assert.Equal(HttpStatusCode.Unauthorized, deniedCustom.StatusCode);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<KiloDbContext>();
         Assert.False(await db.Users.AnyAsync(user => user.ClerkUserId == subject));
+        Assert.False(await db.Exercises.AnyAsync(exercise => exercise.Name == subject));
     }
 
     [Fact]

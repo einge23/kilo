@@ -99,6 +99,19 @@ public sealed class FoundationTests
             GssEncryptionMode = GssEncryptionMode.Disable,
             Timeout = 5
         }.ConnectionString;
+        await using (var previous = CreateContext(connectionString))
+        {
+            var previousMigration = previous.Database.GetMigrations().Single(id => id.EndsWith("_OrganizeUserEntity", StringComparison.Ordinal));
+            await previous.GetService<IMigrator>().MigrateAsync(previousMigration, timeout.Token);
+            Assert.DoesNotContain(await previous.Database.GetAppliedMigrationsAsync(timeout.Token),
+                id => id.EndsWith("_AddExercises", StringComparison.Ordinal));
+            var upgradeUser = new User
+            {
+                ClerkUserId = "upgrade_fixture", TimeZone = "America/Phoenix", MeasurementSystem = "metric"
+            };
+            previous.Users.Add(upgradeUser);
+            await previous.SaveChangesAsync(timeout.Token);
+        }
         var first = await RunMigrator(connectionString);
         Assert.True(first.ExitCode == 0, first.Output);
         await using var db = CreateContext(connectionString);
@@ -120,6 +133,9 @@ public sealed class FoundationTests
         Assert.Equal(migrations, await db.Database.GetAppliedMigrationsAsync());
         var retained = await db.Users.AsNoTracking().SingleAsync(user => user.ClerkUserId == "fixture");
         Assert.Equal(fixture.Id, retained.Id);
+        var upgraded = await db.Users.AsNoTracking().SingleAsync(user => user.ClerkUserId == "upgrade_fixture");
+        Assert.Equal("America/Phoenix", upgraded.TimeZone);
+        Assert.Equal("metric", upgraded.MeasurementSystem);
         Assert.Equal("America/Phoenix", retained.TimeZone);
 
         await using (var write = CreateContext(connectionString))

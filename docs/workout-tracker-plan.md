@@ -4,7 +4,7 @@
 
 Controllers / EF Core 10 / PostgreSQL / Clerk / Docker Compose / Linux
 
-Revised October 7, 2026 for EF Core. Integer IDs. Imperial defaults with explicit lb/kg weights. Routine templates stay separate from workout snapshots.
+Revised October 8, 2026 for EF Core, FluentValidation, and a global exercise catalog with private custom exercises. Integer IDs. Imperial defaults with explicit lb/kg weights. Routine templates stay separate from workout snapshots.
 
 This is a revised implementation plan, not a completed application. The original PDF supplies the product requirements; its code recipes are reference material, not instructions to execute. This revision supersedes those recipes.
 
@@ -20,9 +20,10 @@ Use each slice's fillable progress panel for implementation, verification, statu
 
 - Program.cs composes the host; focused IServiceCollection extensions own API, persistence, and later Clerk registrations.
 - Asp.Versioning.Mvc supplies URL-segment versioning. It replaces the hand-built ApiV1Controller routing base.
-- Native MVC validation returns 400. The previous custom 422 split is intentionally removed before the first client is built.
+- Each request has a FluentValidation validator discovered through DI. Async request-rule validation returns standardized 422 ValidationProblemDetails; malformed JSON and type binding return native 400.
 - Native health checks use KiloDbContext.Database.CanConnectAsync. EF Core owns mapping, scoped contexts, pooled connections, and transactions.
 - Generated EF migrations and their model snapshot grow with the slices. The separate migrator applies them through MigrateAsync. All runtime schema changes use native EF migrations.
+- Global exercises are shared and managed by admins; custom exercises stay private. Native role policies authorize global writes.
 - Feature folders grow inside one API project. Kilo.Persistence shares the model and migrations between the API and separate migrator; Kilo.Tests verifies their behavior. No further architecture layers are needed.
 
 ---page---
@@ -34,7 +35,7 @@ Use each slice's fillable progress panel for implementation, verification, statu
 | 02 | API and migrator release images | 01 |
 | 03 | Repeatable local Compose stack | 02 |
 | 04 | Clerk identity and preferences | 01-03 |
-| 05 | Private exercise library and brands | 04 |
+| 05 | Global catalog, custom exercises, admin policy | 04 |
 | 06 | Routine templates | 05 |
 | 07 | Ordered exercise placements | 06 |
 | 08 | Planned sets and explicit weights | 07 |
@@ -74,17 +75,85 @@ Controllers bind requests and translate outcomes into HTTP. Inject KiloDbContext
 
 Business routes use api/v{version:apiVersion}/..., with [ApiController], [ApiVersion(1.0)], and relative action routes. GET /health is anonymous and unversioned. Explicit routes avoid inheritance surprises. From slice 04 onward, a fallback authorization policy protects business routes by default.
 
-Use camelCase JSON and int IDs. A route uses {id:int:min(1)}; invalid route shapes do not match (404). MVC binding and DataAnnotations validation return 400 ValidationProblemDetails, including invalid semantic input. Use IValidatableObject only for cross-field checks; validate ownership and state in the transaction. Keep implicit required validation enabled.
+Use camelCase JSON and int IDs. A route uses {id:int:min(1)}; invalid route shapes do not match (404). Each request type has a FluentValidation validator registered by assembly scanning. Await ValidateAsync before provisioning or writes. Rule failures return 422 ValidationProblemDetails with camelCase error keys; malformed JSON/type binding stays native 400. Disable MVC implicit required annotations and omit request DataAnnotations/IValidatableObject. Validate ownership and state in the transaction.
 
 Created: 201 with Location. Read/update: 200. Archive/delete: 204. Missing/invalid token: 401. Authenticated policy denial: 403. Missing/foreign/nested mismatch: 404. Lifecycle, archive, or position conflict: 409. Known dependency outage: 503. Unexpected fault: sanitized 500. Use ProblemDetails for errors; status-code middleware fills otherwise empty error responses. Do not treat every database exception as an outage.
 
 ## Database and time
 
-Register KiloDbContext with AddDbContext: one scoped context per request or migrator scope, never a singleton. Await operations sequentially; a context is not thread-safe. Pass CancellationToken to queries, SaveChangesAsync, transactions, and migrations. Use AsNoTracking and DTO projections for reads, tracked entities for writes, and a bounded provider command timeout. All tenant predicates include verified local userId; never use unscoped FindAsync for tenant resources. Composite foreign keys enforce ownership as a second defense.
+Register KiloDbContext with AddDbContext: one scoped context per request or migrator scope, never a singleton. Await operations sequentially; a context is not thread-safe. Pass CancellationToken to queries, SaveChangesAsync, transactions, and migrations. Use AsNoTracking and DTO projections for reads, tracked entities for writes, and a bounded provider command timeout. Private resource predicates include verified local userId; exercise reads additionally allow global rows (user_id IS NULL); never use unscoped FindAsync for tenant resources. Composite foreign keys enforce ownership as a second defense.
 
 Postgres identity columns generate positive integer keys; gaps are normal. Clerk subjects and retry keys remain text. Use timestamptz for UTC instants and date for optional scheduled dates. The Npgsql EF provider maps timestamptz to UTC DateTime and date to DateOnly; map both explicitly in the model. Use TimeProvider for application-generated timestamps, including deterministic timer tests.
 
 SaveChanges is atomic for one batch. Begin an explicit transaction when locks, reads, or several saves must be atomic together. Use EF parameterized SQL only for a concrete PostgreSQL feature such as FOR UPDATE; keep ordinary CRUD in LINQ. Inspect DbUpdateException.InnerException for a known PostgreSQL SQLSTATE and constraint name before translating a conflict. Do not enable sensitive-data logging. Standards basis: controller behavior [1], the Npgsql EF provider [4], and EF queries/transactions [5, 15].
+
+---page---
+# Request validation and 422 responses
+
+## Add rules as their request types arrive
+
+Pin FluentValidation.DependencyInjectionExtensions 12.1.1 [23, 24]. AddKiloApi scans the API assembly for public validators with AddValidatorsFromAssemblyContaining<Program>(). The default lifetime is scoped. No validator is needed before its feature exists; preferences arrive in 04 and exercise writes in 05.
+
+Keep one AbstractValidator<TRequest> beside each request, named PreferencesRequestValidator or ExerciseWriteRequestValidator. Share the exercise validator between private/admin writes. Use NotEmpty for required text and stop a field's cascade before rules requiring a present value. Explicitly use camelCase wire names with OverridePropertyName. Nested input objects use child validators when introduced.
+
+## Explicit asynchronous execution
+
+Inject IValidator<TRequest> into the consuming controller. Await validation with the request cancellation token before CurrentUser provisioning, queries with side effects, or writes. Keep authorization in the native middleware and ownership/lifecycle checks in their workflow. Do not use the unsupported FluentValidation.AspNetCore synchronous auto-validation pipeline or exception-driven validation middleware [23].
+
+```csharp
+// At the start of a request-consuming action:
+var validation = await validator.ValidateAsync(request, ct);
+if (!validation.IsValid)
+{
+    return this.RequestValidationProblem(validation);
+}
+// Only valid requests continue to identity resolution and persistence.
+```
+
+RequestValidationProblem is the shared Hosting extension. Add each failure to controller.ModelState, then call native ValidationProblem(statusCode: 422, instance: HttpContext.Request.Path). ASP.NET Core supplies the validation title, RFC type, and traceId; no custom response envelope is needed. Advertise 422 ValidationProblemDetails on write actions in OpenAPI.
+
+## Stable response contract
+
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc4918#section-11.2",
+  "title": "One or more validation errors occurred.",
+  "status": 422,
+  "instance": "/api/v1/me/preferences",
+  "errors": { "timeZone": ["Use a supported IANA time zone."] },
+  "traceId": "request trace identifier"
+}
+```
+
+Required/empty/null values, unsupported choices and rule violations return 422. Malformed JSON, an absent body, numeric overflow and incompatible bound types remain native 400 ValidationProblemDetails; route mismatch stays 404. A supplied nested weight object needs both value and unit; omission is distinct from valid zero.
+
+## Verification carried into every slice
+
+Exercise validators through HTTP: valid requests, aggregated camelCase errors, the 422 problem shape, malformed/type-binding 400, unchanged rows and no first-request provisioning on failure. Verify authentication/admin denial occurs before validation. Existing PostgreSQL Testcontainers and Bogus fakers remain the test infrastructure. See docs/request-validation-verification.md for this revision's evidence.
+
+---page---
+# Global catalog and private custom exercises
+
+## One library, two fixed scopes
+
+An Exercise has a nullable UserId. Null means a global entry shared by all authenticated users; a positive local UserId means a private custom entry. Do not invent a system user. Scope is fixed after creation; promotion, transfer, cloning, and a seeded catalog are not requested.
+
+GET /exercises returns active globals plus the caller's active custom entries, ordered by name then id. An empty catalog is valid. GET /exercises/{id} permits globals and the caller's entries, including archived detail. Foreign private IDs return 404, including for admins. includeArchived expands only the caller's visible list. ExerciseDto exposes isGlobal, never the owner's ID.
+
+## Writes follow the route and verified identity
+
+| Route family | Creates / changes | Permission |
+| --- | --- | --- |
+| /exercises | Caller-owned custom entries | Authenticated owner |
+| /admin/exercises | Global entries only | Admin policy |
+
+Personal POST always creates a custom entry, even for an admin. Personal PUT/DELETE on a visible global returns 403; global edits use the admin route. Admin writes against a private or missing ID return 404. Admin status never unlocks another account's private data. Requests contain no owner, role, or scope switches.
+
+## Carry this model through later slices
+
+05 implements read/create/update and the native admin policy. Archive endpoints and their locking/usage rules arrive in 15. Routine attachment in 07 accepts an active global or caller-owned custom exercise; routine/session ownership stays private. Snapshot creation in 10 copies either scope's metadata and original weights; later admin edits cannot rewrite history.
+
+Native composite foreign keys and checks enforce exercise access in 07 and 10. A nullable owner alone cannot serve as the global side of a checked composite foreign key. Add the derived access key only when placements need it; see the slice-07 schema contract. This key is internal, not an API ID or new authorization framework.
 
 ---page---
 # Growth map and migration policy
@@ -113,9 +182,9 @@ Kilo.Tests/                 # real PostgreSQL and HTTP checks
 | First used | EF migration name | Adds |
 | --- | --- | --- |
 | 01 / 04 | CreateUsers | Identity and preference storage |
-| 05 | AddExercises | Exercise library, optional brands |
+| 05 | AddExercises | Global/private exercises, optional brands |
 | 06 | AddRoutines | Routine metadata |
-| 07 | AddRoutineExercises | Owned ordered placements |
+| 07 | AddRoutineExercises | Owned placements and exercise access keys |
 | 08 | AddRoutineSets | Planned sets and weight pairs |
 | 09 | AddRoutineSchedule | One routine per user/weekday |
 | 10 | AddSessions | Sessions and complete snapshots |
@@ -144,7 +213,7 @@ Slices 01-03 already exist. This revision converts their persistence to EF while
 ## Build sequence
 
 1. Keep net10.0, nullable reference types, implicit usings, and the existing valid SDK selection. Commit package locks and restore in locked mode.
-2. Retain Asp.Versioning.Mvc and Microsoft.AspNetCore.OpenApi in Kilo. Reference Kilo.Persistence from the API and migrator.
+2. Retain Asp.Versioning.Mvc and Microsoft.AspNetCore.OpenApi; pin FluentValidation.DependencyInjectionExtensions 12.1.1 in Kilo. Reference Kilo.Persistence from the API and migrator.
 3. In Persistence pin Microsoft.EntityFrameworkCore.Relational 10.0.12, Microsoft.EntityFrameworkCore.Design 10.0.12 (PrivateAssets=all), Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3, and configuration environment support 10.0.12. Keep Hosting 10.0.12 in the migrator. The provider brings Npgsql; remove the former data-access packages.
 4. Add User, KiloDbContext, shared database registration, and a design-time factory. Keep API hosting extensions and slim Program.cs.
 5. Pin dotnet-ef 10.0.12 in the local tool manifest. Generate CreateUsers in Persistence/Migrations; commit its designer and model snapshot. Never generate future tables in this baseline.
@@ -194,6 +263,7 @@ public partial class Program { }
 
 ```csharp
 using Asp.Versioning;
+using FluentValidation;
 
 namespace Kilo.Hosting;
 
@@ -202,7 +272,10 @@ public static class ApiServiceCollectionExtensions
     public static IServiceCollection AddKiloApi(
         this IServiceCollection services)
     {
-        services.AddControllers();
+        services.AddControllers(options => options
+            .SuppressImplicitRequiredAttributeForNonNullableReferenceTypes
+                = true);
+        services.AddValidatorsFromAssemblyContaining<Program>();
         services.AddProblemDetails();
         services.AddOpenApi();
         services.AddSingleton<TimeProvider>(TimeProvider.System);
@@ -448,6 +521,7 @@ The console migrator has no web launch profile: explicitly selecting Development
 ```powershell
 dotnet add Kilo package Asp.Versioning.Mvc --version 10.2.1
 dotnet add Kilo package Microsoft.AspNetCore.OpenApi --version 10.0.12
+dotnet add Kilo package FluentValidation.DependencyInjectionExtensions --version 12.1.1
 dotnet add Kilo.Persistence package Npgsql.EntityFrameworkCore.PostgreSQL --version 10.0.3
 dotnet add Kilo.Persistence package Microsoft.EntityFrameworkCore.Relational --version 10.0.12
 # EF Design 10.0.12 is a private tooling reference; local dotnet-ef is pinned too.
@@ -461,7 +535,7 @@ These are verified package pins for recipe checks, not automatic update promises
 
 ## One focused runnable integration suite
 
-Create Kilo.Tests with the chosen stable xUnit runner and Microsoft.AspNetCore.Mvc.Testing 10.x. Use WebApplicationFactory<Program> and a disposable real Postgres database supplied by test configuration. Reuse that small harness for future slices. Use the real Npgsql EF provider; neither EF InMemory nor SQLite verifies PostgreSQL identity, constraints, and locking.
+Create Kilo.Tests with the chosen stable xUnit runner and Microsoft.AspNetCore.Mvc.Testing 10.x. Use WebApplicationFactory<Program> and an isolated PostgreSQL Testcontainer. Reuse that small harness for future slices. Docker is required; database checks must not silently skip. Bound migrator subprocess checks with a deadline and terminate their own process on timeout. Use the real Npgsql EF provider; neither EF InMemory nor SQLite verifies PostgreSQL identity, constraints, and locking.
 
 - Migrate an empty database; assert users and native EF migration history exist. Insert a fixture and rerun; assert the fixture and journal row count are unchanged.
 - Start with valid settings; GET /health returns 200. Stop the test DB or point to an unreachable endpoint; it returns 503 within the bounded check deadline plus transport overhead. Bring DB back; readiness recovers.
@@ -597,7 +671,7 @@ No Compose-only unit suite. Store one reproducible startup/failure check with th
 
 ## Already exists
 
-01's users table already holds Clerk subject, timezone, and measurement preference. Reuse the scoped DbContext, MVC validation, and v1 versioning. Health stays anonymous.
+01's users table already holds Clerk subject, timezone, and measurement preference. Reuse the scoped DbContext, validator DI registration, and v1 versioning. Health stays anonymous.
 
 ## Add and implement
 
@@ -605,7 +679,8 @@ No Compose-only unit suite. Store one reproducible startup/failure check with th
 2. Let the handler retrieve/cache trusted signing metadata and rotate keys. Set MapInboundClaims=false; verify issuer, lifetime, signing key, and intended algorithm. Validate audience when your Clerk token setup defines it. Require nonblank verified sub and allowed azp in OnTokenValidated [10]. No Clerk secret API key is needed just for signature verification.
 3. Register a fallback policy requiring authenticated users, and a named frontend CORS policy with explicit configured origins. CORS permission and token authorized-party validation are separate checks even if their configured origins match.
 4. Add Features/Me with CurrentUser, preferences requests/responses, and MeController. Resolve sub from the authenticated principal only. Query Users by verified subject, add a User when absent, then SaveChangesAsync. On the named subject unique-key race, detach the failed Added entity and requery the winning row; do not swallow other DbUpdateException failures. Cache the resolved ID in the scoped resolver for that request.
-5. GET /me returns the local profile. PUT /me/preferences replaces both fields. Validate imperial/metric and an actual resolvable IANA timezone (UTC accepted); verify Linux runtime support. Never change stored workout weights on preference updates.
+5. GET /me returns the local profile. PUT /me/preferences replaces both fields. Add PreferencesRequestValidator beside its request. Validate imperial/metric and an actual resolvable IANA timezone (UTC accepted); verify Linux support. Await validation before CurrentUser provisions an account. Never change stored workout weights on preference updates.
+6. Supply the API issuer and authorized-party origins in native and Compose configuration. The migrator needs no Clerk settings. Keep public placeholders in .env.example; credentials remain local. Audience is optional and must match the token setup when enabled.
 
 ## Program.cs delta after the two existing registrations
 
@@ -632,12 +707,12 @@ Routes: GET /api/v1/me; PUT /api/v1/me/preferences. New users default to UTC and
 - Valid identity plus unmet authorization policy returns 403. Foreign-data tests begin in 05.
 - Rotate fixture signing keys and verify metadata refresh. An outage with usable cached metadata still verifies valid cached-key tokens.
 - No usable trusted metadata: deny the request. Return 503 only when metadata retrieval failure is positively identified as the cause. Unknown key or invalid signature alone remains 401. Preserve this distinction in one auth-specific failure hook; do not broadly convert authentication errors to 503.
-- PUT America/Phoenix + metric, then imperial; verify persistence. Missing/unknown preference or unknown timezone returns 400 and changes nothing.
+- PUT America/Phoenix + metric, then imperial; verify persistence. Missing/unknown preference or unknown timezone returns 422 and changes nothing; malformed JSON/type binding returns 400. Neither rejection provisions a new account.
 - Anonymous /health and allowed CORS preflight still work. A disallowed browser origin receives no CORS permission.
 
 ## Test shape
 
-Extend the existing WebApplicationFactory/Postgres fixture. Ordinary feature tests may use a test authentication handler; keep a separate small real JWT/JWKS fixture for signature, claim, key rotation, and outage behavior. Do not retest the internals of Microsoft's JWT library with a large mock suite.
+Use WebApplicationFactory with PostgreSQL Testcontainers. Feature tests use a test authentication handler; native JWT tests use fixture discovery/public JWKS responses. Production OpenAPI returns 404 for authenticated requests and 401 for anonymous requests.
 
 ## Acceptance
 
@@ -645,58 +720,91 @@ Extend the existing WebApplicationFactory/Postgres fixture. Ordinary feature tes
 
 ## Carry forward
 
-Every feature receives local userId from CurrentUser, never from a request body. Business controllers use the established v1 attributes. For created resources include the route version when generating Location with CreatedAtAction.
+Resolve local userId through CurrentUser, never a request body. Keep explicit v1 controller routes and include version when generating CreatedAtAction links.
 
 @progress 04
+
+---page---
+# Slice 05 - Native admin authorization
+
+## Extend the existing Clerk registration
+
+Slice 04 already verifies JWT signature, issuer, lifetime and authorized party. Keep those checks. In AddKiloClerk, set TokenValidationParameters.RoleClaimType = "role" alongside NameClaimType = "sub" and MapInboundClaims = false. ASP.NET Core can then use its native role requirement [17, 18].
+
+```csharp
+services.AddAuthorizationBuilder()
+    .SetFallbackPolicy(new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser().Build())
+    .AddPolicy("Admin", policy => policy
+        .RequireAuthenticatedUser()
+        .RequireRole("admin"));
+```
+
+Keep authentication and authorization in Hosting, not Program.cs. Protect AdminExercisesController with [Authorize(Policy = "Admin")], [ApiController], [ApiVersion(1.0)], and [Route("api/v{version:apiVersion}/admin/exercises")]. An explicit policy requires authentication itself; the fallback policy is not added automatically. No custom handler, ASP.NET Identity store, or new package is needed.
+
+## Configure the signed claim in Clerk
+
+Use Clerk Dashboard or a trusted backend to set an administrator's public metadata to {"role":"admin"}. Browser clients can read public metadata but cannot set it. Never use unsafe metadata, request headers, or request bodies to grant roles [19]. Under Sessions / Customize session token, merge this compact top-level claim into the existing configuration [20]:
+
+```json
+{ "role": "{{user.public_metadata.role}}" }
+```
+
+Ordinary users have no admin role. Require the exact value admin; missing, null or differently cased values do not grant access. Changing metadata takes effect in newly refreshed tokens; an already issued valid token retains its claims until expiry. Refresh after role changes and document this limit; do not promise immediate revocation.
+
+## Verify before enabling global writes
+
+Exercise the real policy with native JwtBearer and fixture-signed tokens: valid admin succeeds, valid ordinary/missing/wrong-case role returns 403, and absent/invalid/forged bearer returns 401. A body or header claiming admin cannot change that result. Retain the slice-04 identity, rotation and outage regressions.
 
 ---page---
 # Slice 05 - Exercise library
 
 ## Already exists
 
-Authenticated local users, scoped CurrentUser, v1 controllers, scoped EF persistence, and a real DB test harness. Generate AddExercises from the migration reference.
+Authenticated local users, scoped CurrentUser, EF persistence, native JWT fixtures, and PostgreSQL Testcontainers. Extend Clerk authorization as on the preceding page, then generate only AddExercises.
 
-## Add and implement
+## Add and implement in this order
 
-1. Create Features/Exercises with ExerciseWriteRequest, ExerciseDto, and ExercisesController; add the Exercise entity and Fluent mapping to Persistence. Simple CRUD injects KiloDbContext directly. Group feature registrations only when there is real registration growth.
-2. Keep DTO validation with the request. Require a nonblank trimmed name; normalize optional description to empty string. Validate the trimmed brand in IValidatableObject (rather than applying a raw-string length attribute), then normalize omitted/null/blank brandName to null and limit a nonempty brand to 100 characters. PUT omission clears it.
-3. Use LINQ with explicit user predicates, read-only DTO projections, tracked Add/updates, and SaveChangesAsync. EF retrieves generated IDs/defaults. Every list/detail/update filters by verified UserId. Project nested API objects explicitly; never return tracked entities directly.
-4. Implement list, detail, create, metadata replacement. Exclude archived rows by default; includeArchived is an explicit query option. Updates to an owned archived exercise return 409; absent/foreign IDs return 404. Archive itself arrives in 15.
-5. Use CreatedAtAction for 201 Location, passing version=1 and id. Verify it round-trips through real routing.
+1. Reuse the HTTP fixture; rename MeApiFactory to KiloApiFactory as Exercises becomes its second feature. Retain ClerkApiFactory for signed-token policy tests. Add a focused failing admin-policy check before wiring RoleClaimType and the named policy.
+2. Add Persistence/Entities/Exercise and mapping: nullable UserId, shared metadata, archived/created instants. Null owner is global; private creation derives its owner through CurrentUser. Keep delete behavior restrictive. Generate and review migration, designer and snapshot together.
+3. Add Features/Exercises with one ExerciseWriteRequest, ExerciseDto, ExercisesController and AdminExercisesController. Simple CRUD uses scoped KiloDbContext directly. Share request validation and DTO shape; no forwarding service or repository.
+4. Require a nonblank trimmed name. Omitted/null description becomes empty; preserve Unicode and multiline text. Use ExerciseWriteRequestValidator on both write controllers; validate trimmed brand: blank becomes null, nonempty maximum 100 characters. PUT omission clears brand. Brand remains free-form equipment text.
+5. Implement shared list/detail reads, private POST/PUT and admin global POST/PUT. Order lists by name then id; exclude archives unless includeArchived. Own/global archived metadata writes return 409. Foreign private/missing IDs return 404. Personal edits of globals return 403. Scope cannot change through a write request.
+6. Return 201 with shared detail Location for either creation route, passing version="1" (a string) and id to CreatedAtAction. The versioning URL-generation constraint requires a string. Cross-controller admin creation targets ExercisesController's detail action. Archive writes arrive in 15.
 
-## Read operation - partial body using slice-05 types
+## Read projection - partial body using slice-05 types
 
 ```csharp
 return await db.Exercises.AsNoTracking()
-    .Where(x => x.Id == id && x.UserId == userId)
-    .Select(x => new ExerciseDto(
-        x.Id, x.Name, x.Description, x.BrandName, x.ArchivedAt))
+    .Where(x => x.Id == id &&
+        (x.UserId == null || x.UserId == userId))
+    .Select(x => new ExerciseDto(x.Id, x.Name, x.Description,
+        x.BrandName, x.UserId == null, x.ArchivedAt))
     .SingleOrDefaultAsync(ct);
 ```
 
-Implement those entity/DTO types in 05. For mutations load the owned entity, validate state, change its properties, and SaveChangesAsync(ct). No repository forwarding layer or context per nested call.
-
-Routes: GET/POST /exercises; GET/PUT /exercises/{id}. Brand is optional free-form equipment text, not a separate catalog or foreign key.
+Load private mutations by Id and verified owner; admin mutations by Id and UserId == null. SaveChangesAsync(ct) retrieves generated IDs/defaults. Never return tracked entities or reuse the read predicate as unrestricted write authorization.
 
 ---page---
 # Slice 05 - Verify exercise CRUD
 
 ## Gate
 
-- Create Bench Press and Chest Press with Unicode/apostrophes/multiline descriptions. Verify 201, positive numeric ID, camelCase DTO, and a working versioned Location.
-- Create null, blank, padded, 100-character and 101-character brands. Verify normalization, accepted boundary, and 400 failure boundary.
-- List empty accounts and separate accounts. Foreign detail/update is 404 and changes nothing.
-- PUT without brandName clears a previous brand. Update preserves the resource ID and unrelated fields.
-- Insert an archived test fixture; default list hides it, includeArchived shows it, update returns 409.
-- Malformed JSON, missing required name, and semantic invalid fields return 400 ValidationProblemDetails. /api/exercises and /api/v2/exercises do not invoke v1.
+- Admin creates globals; two ordinary accounts see them. Each account creates custom entries visible only to itself. An admin cannot read/update another account's custom entry.
+- Native signed-token tests prove admin success, ordinary/missing/wrong-case role 403, and absent/invalid/forged token 401. Body/header owner, scope and role values cannot grant access or change creation scope.
+- Personal POST by an admin still creates a private entry. Personal PUT of a global returns 403. Admin PUT of a private/missing ID returns 404. Rejected writes leave rows unchanged.
+- Exercise both write routes with Unicode/apostrophes/multiline descriptions, positive IDs, camelCase/isGlobal DTOs, and versioned Location round trips.
+- Test null/blank/padded/100/101-character brands; verify normalization, 422 rule boundaries, and PUT omission clearing brand.
+- Test empty catalogs, name/id ordering, archived fixtures, default hiding and includeArchived visibility. Visible archived metadata updates return 409; foreign private detail/update stays 404.
+- Malformed JSON/type binding returns 400; blank/missing names return 422 ValidationProblemDetails with camelCase errors and traceId. Invalid first writes never provision users. Unversioned/v2 routes do not invoke v1. Verify additive migration replay and no pending model changes.
 
 ## Acceptance
 
-05.1 Create/list works. 05.2 Ownership comes from verified identity. 05.3 Names/descriptions round-trip. 05.4 Lists are private and may be empty. 05.5 Optional brands round-trip. 05.6 PUT can clear brands. 05.7 Brand limits hold.
+05.1 Shared catalog reads. 05.2 Verified private ownership. 05.3 Metadata round trips. 05.4 Private isolation, including admins. 05.5 Brand limits/clearing. 05.6 Native admin policy. 05.7 Fixed scope and guarded writes. 05.8 Archived filtering and deterministic order.
 
 ## Carry forward
 
-Keep the same explicit LINQ ownership predicate and input validation style in routines. Library metadata remains editable; sessions will later copy historical values instead of joining current descriptions/brands.
+Reuse DTO validation for private routines and the shared Testcontainers/Bogus patterns. The slice-05 gate passed October 8 with 72 tests, migration upgrade/replay, images and isolated Compose; see docs/slice-05-verification.md. Re-run meaningful gates after changes; PDF regeneration alone does not prove completion.
 
 @progress 05
 
@@ -721,7 +829,7 @@ Routes: GET/POST /routines; GET/PUT /routines/{id}. Creating an empty routine is
 
 - Create Upper A, Lower A, Abs and Arms, Upper B, Lower B with distinct generated IDs.
 - Create empty routines with/without descriptions; verify detail collections are empty rather than null.
-- Reject blank names with 400 and no row. Exercise standard missing/foreign detail/update 404 and archived update 409.
+- Add RoutineWriteRequestValidator; reject blank names with 422 and no row. Exercise standard missing/foreign detail/update 404 and archived update 409.
 - A second account lists none of the first account's routines. Created Location works with the API version.
 
 ## Acceptance
@@ -735,13 +843,13 @@ Routes: GET/POST /routines; GET/PUT /routines/{id}. Creating an empty routine is
 
 ## Already exists
 
-Owned exercises and routines. Generate AddRoutineExercises with composite owner foreign keys and an active-position unique index. Extend routine details to read ordered placements.
+Global/private exercises and owned routines. Generate AddRoutineExercises with the derived library access key, composite foreign keys/checks, and an active-position unique index. Extend routine details to read ordered placements.
 
 ## Add and implement
 
 1. Add POST/PUT nested placement actions to the routine feature. Use route name placementId instead of ambiguous exerciseId; the wire path shape stays compatible. Body exerciseId is the library exercise ID.
 2. Create distinct placement IDs, allowing the same library exercise more than once. Store position>0, placement-specific description, and defaultRestSeconds>=0. Existing placement exerciseId is immutable; replacement will archive and create a new placement.
-3. For each placement write, begin an explicit EF ReadCommitted transaction. Lock the owned routine first, then the owned library exercise when attaching. Require both active. Nested update must prove Placement.RoutineId equals the route routineId and UserId equals the caller.
+3. For each placement write, begin an explicit EF ReadCommitted transaction. Lock the owned routine first, then the visible global or caller-owned library exercise when attaching. Require both active. Store ExerciseScopeId from the selected row (UserId ?? 0), never the request; the scope FK/check prevents cross-user references. Nested update must prove Placement.RoutineId equals the route routineId and UserId equals the caller.
 4. Return current library exercise name/brand through the routine detail join; store no placement brand column. Sets remain [] until 08.
 5. Use the same scoped context, transaction, and token for every operation. Translate only DbUpdateException wrapping the named active-position unique violation to 409; unrelated database faults remain errors.
 
@@ -754,7 +862,7 @@ var routine = await db.Routines.FromSqlInterpolated($"""
     SELECT * FROM public.routines
     WHERE id = {routineId} AND user_id = {userId} FOR UPDATE
     """).AsTracking().SingleOrDefaultAsync(ct);
-// Validate routine, then lock/validate exercise with the same pattern.
+// Validate routine, then lock/validate a global or owned exercise.
 // Add the owned placement only after those checks.
 await db.SaveChangesAsync(ct);
 await transaction.CommitAsync(ct);
@@ -770,9 +878,9 @@ Lock ordering starts here: routine parent before library exercise; all code that
 ## Gate
 
 - Add positions 1-3 and verify ascending detail order. Give repeated Bench Press placements distinct instructions and IDs.
-- Reject nonpositive/fractional positions, negative/noninteger rest, and duplicate active positions. A unique collision is 409; request validation is 400.
-- Attach foreign exercise/routine or update a placement under the wrong routine; return 404 and preserve all rows.
-- Attach an owned archived exercise or edit an archived routine; return 409. The lock/state check must not only rely on a stale read.
+- Reject nonpositive/fractional positions, negative/noninteger rest, and duplicate active positions. A unique collision is 409; request-rule validation is 422 and fractional/noninteger binding is 400.
+- Attach global and own custom entries successfully. Foreign custom/routine or wrong-parent IDs return 404. Direct invalid scope/owner inserts fail database constraints.
+- Attach an archived global/own custom exercise or edit an archived routine; return 409. The lock/state check must not only rely on a stale read.
 - Change a library brand; both repeated routine placements show the current brand, without writing the placement rows.
 - Race two inserts at one position; one commits and one returns 409, with no partial work.
 
@@ -791,13 +899,13 @@ Template child writes lock the routine parent. This makes reorder and archive at
 
 ## Already exists
 
-Owned ordered placements and the routine transaction convention. Generate AddRoutineSets; extend routine details with ordered sets. Introduce shared WeightDto when both templates and future results use it.
+Owned placements and exercise access keys and the routine transaction convention. Generate AddRoutineSets; extend routine details with ordered sets. Introduce shared WeightDto when both templates and future results use it.
 
 ## Add and implement
 
 1. Add POST/PUT sets under a route routineId/placementId. Prove the complete routine->placement->set chain, not only ownership of the final ID. Lock the routine before writing.
-2. Validate setType warmup/working, position>0, targetRepsMin>0, targetRepsMax>=min. Integer binding rejects fractional reps. Use DataAnnotations plus IValidatableObject for the range relationship.
-3. A weight is null or a complete {value,unit} object. Use required nullable decimal?/string input members with [Required] so an omitted value cannot silently become zero; response WeightDto contains decimal/string. Validate value>=0 and unit lb/kg. Reject JSON outside decimal range. No unit inference from a profile.
+2. Validate setType warmup/working, position>0, targetRepsMin>0, targetRepsMax>=min. Integer binding rejects fractional reps. Use a request validator for required fields and the range relationship; await validation before writes.
+3. A weight is null or a complete {value,unit} object. Use nullable decimal?/string input members and a child weight validator with NotNull/NotEmpty so an omitted value cannot silently become zero; response WeightDto contains decimal/string. Validate value>=0 and unit lb/kg. Reject JSON outside decimal range. No unit inference from a profile.
 4. Map value/unit as separate nullable entity properties; the DB check enforces both absent or both present. Store exact original decimal values. Use unconstrained numeric (no fixed-scale rounding), bounded at the API by decimal.
 5. Nullable restSeconds inherits the placement default; explicit zero means zero. Resolve this only when a session or extra set is created. Keep the template override nullable.
 
@@ -822,9 +930,9 @@ Map TargetWeightValue and TargetWeightUnit explicitly. Use HasColumnType("numeri
 ## Gate
 
 - Two warmup plus three working sets produce five ordered rows.
-- Fixed 10-10 and ranged 6-8 targets round-trip. Inverted/nonpositive/fractional ranges return 400.
+- Fixed 10-10 and ranged 6-8 targets round-trip. Inverted/nonpositive ranges return 422; fractional integer binding returns 400.
 - Null, zero, 2.5, 45, 135.5 lb and 60 kg round-trip exactly through JSON and SQL.
-- Weight object {} or missing value/unit, unknown unit, negative value, invalid set type, and negative rest return 400 without writes. Direct SQL with a half-present value/unit pair is rejected too.
+- Weight object {} or missing value/unit, unknown unit, negative value, invalid set type, and negative rest return 422 without writes. Malformed numeric binding/decimal overflow returns 400. Direct SQL with a half-present value/unit pair is rejected too.
 - A null rest override stays null; zero stays zero; 120 stays 120. 10 verifies resolved copies.
 - Wrong routine/placement/set chain and foreign rows return 404. Position collisions return 409, atomically.
 
@@ -857,7 +965,7 @@ Owned templates and profile timezone. Generate AddRoutineSchedule with primary k
 
 - Assign the original routines Wednesday-Sunday (3-7). Replace Wednesday twice; one row remains.
 - Assign Upper A to Monday and Wednesday; both exist. Clear Wednesday twice; Monday and other users stay unchanged.
-- Use {weekday:int} plus [Range(1,7)]: a bound invalid weekday returns 400; a noninteger route is 404. Verify both.
+- Keep {weekday:int}; bind the weekday into the slice request input and validate 1-7 with FluentValidation. A bound invalid weekday returns 422; a noninteger route is 404. Verify both.
 - Foreign routine returns 404; owned archived routine returns 409. No schedule row is written.
 - Test UTC day boundaries for America/Phoenix and a DST-observing zone.
 
@@ -878,13 +986,13 @@ Complete templates and transactional EF workflows. Generate AddSessions and its 
 
 1. POST /routines/{id}/sessions receives optional scheduledDate and an Idempotency-Key: 1-128 visible ASCII characters. Validate before opening a transaction. The key is text, not a generated resource ID.
 2. In a RepeatableRead transaction, look up (user_id,key). If present, compare original routineId and scheduledDate: same payload returns existing snapshot with 200; different payload returns 409. This replay remains valid even if the routine was subsequently archived.
-3. If new, require the owned active routine and at least one active planned set. Copy routine metadata, active ordered placements, current exercise names/brands, ordered targets, both weight columns, and resolved rest. Actual reps/weights/completion timestamps start null.
+3. If new, require the owned active routine and at least one active planned set. Copy routine metadata, active ordered placements, current global/custom names/brands, validated exercise access keys, ordered targets, both weight columns, and resolved rest. SessionExercise scope FK/check preserves global-or-own access. Actual reps/weights/completion timestamps start null.
 4. Keep sourceRoutineExerciseId for placement matching; never substitute library exerciseId. Return 201 with session Location for a new snapshot. GET /sessions/{id} reads the snapshot only.
 5. Let errors escape to roll back all rows. Unique-key races require a fresh transaction/snapshot to resolve the persisted key. Use a fresh context as well as a fresh transaction per retry, because rolled-back tracked objects are not reset automatically. Bounded retry (for example, at most 3 attempts) applies only to the named start-key unique violation, serialization failure, or deadlock for this atomic workflow. Never retry arbitrary writes automatically.
 
 ## Why RepeatableRead here
 
-Several SELECT/INSERT statements must see one committed template state, including concurrent brand edits. The routine parent lock convention alone does not serialize independent library metadata updates. RepeatableRead supplies a consistent snapshot; transaction conflicts restart the whole copy, not just the last statement [11].
+Several SELECT/INSERT statements must see one committed template state, including concurrent global admin or private owner brand edits. The routine parent lock convention alone does not serialize independent library metadata updates. RepeatableRead supplies a consistent snapshot; transaction conflicts restart the whole copy, not just the last statement [11].
 
 Project templates with AsNoTracking within the RepeatableRead transaction. Build a new tracked session graph and SaveChangesAsync; EF propagates generated parent keys to children. Rest resolves with set.RestSeconds ?? placement.DefaultRestSeconds. Copy weight value and unit without conversion. Workouts may start on any day; scheduledDate is optional contextual data.
 
@@ -893,10 +1001,10 @@ Project templates with AsNoTracking within the RepeatableRead transaction. Build
 
 ## Gate
 
-- Compare a new session with its routine: copied names, brand, instructions, ordering, set types, reps, weight pairs, resolved rest. Verify all actual fields are null.
+- Snapshot global and custom placements: copied names, brand, instructions, ordering, set types, reps, weight pairs, resolved rest. Invalid private exercise scope references fail DB constraints. Verify all actual fields are null.
 - Copy 135.5 lb and 60 kg; switch preference; copied original numbers/units remain identical.
 - Same key/payload sequentially and concurrently returns one session. First new response is 201; replay is 200. Changed routine/date with that key is 409.
-- The same key from another user is independent. Invalid key is 400. Foreign routine/session is 404.
+- The same key from another user is independent. Invalid key fails the slice input validator with 422. Foreign routine/session is 404.
 - Owned archived routine or no active planned sets returns 409 and no snapshot. Replaying a previously successful start still returns it.
 - Fail halfway through copy; no parent/child rows survive. Race template edits and brand changes against start; every snapshot matches one committed state.
 - Force unique/serialization race; verify a fresh bounded attempt and no duplicate data. Exhausted confirmed transient retry is 503 with safe retry guidance.
@@ -987,7 +1095,7 @@ For the first page omit the cursor predicate. Validate bounds and serialization 
 - Repeat each finalization and verify the original finishedAt. Switching final states and later mutations return 409.
 - Race result writes, complete, and abandon; one serialized valid outcome persists. No write lands after finalization.
 - Traverse several pages with tied startedAt values; no duplicates/omissions in a static fixture. Foreign history never appears.
-- Invalid limit, status, or cursor returns 400 with no untrusted SQL interpolation. Verify nextCursor=null on the last page.
+- Bound invalid limit, status, or cursor returns 422 from the slice query validator; type binding returns 400. Never interpolate untrusted SQL. Verify nextCursor=null on the last page.
 - Read 135.5 lb history after metadata/preferences change; snapshot targets, results, brands and units are intact.
 
 ## Acceptance
@@ -1077,19 +1185,18 @@ Archive columns/indexes, owned parent locks, immutable snapshots, and full routi
 1. Reorder takes exactly the active child IDs, once each. Lock routine parent and validate the complete owned list. Allocate temporary positive positions above the current maximum, then SaveChangesAsync before assigning final 1..N positions and saving again, all inside one explicit transaction. Two saves avoid immediate unique-index collisions; rollback preserves the original order. Check int overflow before any update; reject safely rather than colliding.
 2. DELETE planned set/placement archives the source row. Do not physically delete source rows referenced by historical sessions. New starts exclude archived children; old active/completed sessions retain copied values.
 3. DELETE routine locks it, archives it, and clears schedule entries in one transaction. Same owned archive returns 204. Metadata changes/start/schedule writes reject the archived state.
-4. DELETE exercise locks its owned row. Reject with 409 if an unarchived placement in an unarchived routine uses it. Creation of a placement already locks that same exercise; keep routine-before-exercise ordering where both locks are needed.
-5. To replace a movement, archive old placement and create a new one. Library brand edits affect routine reads and future starts; they never update session snapshot rows.
+4. Personal DELETE /exercises/{id} locks the owned custom row; visible globals return 403. Admin DELETE /admin/exercises/{id} requires the Admin policy and locks only global rows; private/missing IDs return 404. Same authorized archive returns 204. Reject active usage with 409; global usage is checked across all accounts without exposing their data. Placement creation locks the same row; keep routine-before-exercise ordering.
+5. To replace a movement, archive old placement and create a new one. Extend slice-05 metadata writes to lock/recheck the exercise before updates now that archive can race them. Brand edits affect routine reads and future starts; they never update session snapshot rows.
 
-## Archive guard - partial LINQ using slice-07 entities
+## Archive guard - after an authorized exercise row lock
 
 ```csharp
 var used = await db.RoutineExercises.AnyAsync(x =>
-    x.ExerciseId == exerciseId && x.UserId == userId
-    && x.ArchivedAt == null && x.Routine.ArchivedAt == null
-    && x.Routine.UserId == userId, ct);
+    x.ExerciseId == exerciseId
+    && x.ArchivedAt == null && x.Routine.ArchivedAt == null, ct);
 ```
 
-Execute after taking the exercise lock. A standalone NOT EXISTS followed by an update can race a new placement. Keep errors before writes when possible; rollback any rejected multi-command operation.
+The authorized row determines scope first. This guard intentionally checks all usages, so a global cannot archive while any account actively uses it. Return a generic 409, never private account/routine details. Execute after taking the exercise lock. A standalone NOT EXISTS followed by an update can race a new placement. Keep errors before writes when possible; rollback any rejected multi-command operation.
 
 ---page---
 # Slice 15 - Verify editing and historical fidelity
@@ -1100,7 +1207,7 @@ Execute after taking the exercise lock. A standalone NOT EXISTS followed by an u
 - Reorder placements and sets. Duplicate, missing, extra, foreign IDs, and overflow-risk temporary positions are rejected without changing order.
 - Archive planned set/placement; future starts omit it, previous snapshots keep it. IDs are never reused.
 - Archive a scheduled routine; assignments clear atomically. History stays readable; starts/metadata/schedule changes reject it.
-- Exercise with active usage returns 409. After all active usage is removed, archive succeeds and historical references remain intact.
+- Global active usage in either of two accounts blocks admin archive with a generic 409. Custom archive remains owner-only. Ordinary global archive returns 403; admin routes cannot archive private IDs. Removing all active usage permits archive without changing snapshots.
 - Race exercise archive/placement attach, routine archive/schedule assignment, and reorder/start. Assert one valid serialized result and no mixed snapshot or duplicate position.
 
 ## Acceptance
@@ -1270,7 +1377,7 @@ Working release/deploy/backup/restore procedures. Add bounded logging configurat
 
 Run against the Linux host through HTTPS. Retain evidence before marking the app release-ready.
 
-- Sign in with two accounts; verify provisioning, claim restrictions, private lists and 404 ownership boundaries.
+- Sign in with two ordinary accounts and an admin; verify global visibility, admin-only global writes, private isolation even from admins, native 401/403, and foreign-private 404.
 - Create all five routines and weekday assignments with descriptions, optional brands, repeated movements, warmup/working sets, rest overrides, and mixed lb/kg targets.
 - Start with a retry key, retry concurrently, log zero and nonzero reps at 135.5 lb/60 kg, correct a result, add/remove an extra set, reconstruct the timer, and finish partially.
 - Edit template targets and library brand; old active/completed snapshots remain identical and new snapshots use current metadata. Previous performance matches source placements.
@@ -1283,27 +1390,29 @@ Run against the Linux host through HTTPS. Retain evidence before marking the app
 
 The repository implements slices 01-03 with EF persistence and a separate MigrateAsync executable. The transition verification record and slice-02/03 records contain the actual build, real-Postgres, image, and Compose checks. PDF regeneration does not prove a feature gate passed.
 
-Slices 04-20 remain planned work: Clerk, workout features, Linux deployment, and recovery are not implemented or certified. SQL contracts in the appendix describe future mappings; they do not authorize generating all future tables now.
+Slice 04 implements Clerk identity, local profiles and preferences; its original gate passed with 35 tests (docs/slice-04-verification.md). Slice 05 adds global/private exercises and native admin policies. Its gate passed with 72 tests, seeded EF upgrade/replay and refreshed image/Compose checks (docs/slice-05-verification.md). Slices 06-20 remain planned. SQL contracts describe future mappings, not authorization to generate all tables now.
 
-## Continue with 04
+Request validation now uses automatically registered FluentValidation validators and standardized 422 errors. The follow-up verification passed 89 tests with no skips; see docs/request-validation-verification.md. Earlier slice records retain their original evidence and validation policy.
 
-Retain the scoped context, native migration history, slim startup, image pair, and Compose gate. Introduce verified Clerk identity and use the existing users table. No persistence rewrite or future feature scaffolding is needed.
+## Continue with 06 when requested
+
+Retain the scoped context, native migration history, slim startup, exercise validation, global/private boundaries and shared KiloApiFactory. Routine templates remain private; placement/snapshot access keys arrive only in 07/10 and archive writes in 15. Configure the real Clerk role/session claim as documented. No future feature scaffolding is needed.
 
 ---page---
 # API reference - route catalog
 
-All business paths below are prefixed /api/v1 and protected after 04. IDs are positive ints. The path variable names distinguish library exercise, routine placement, and session exercise. This revision intentionally uses 400 for invalid bound input rather than the old 422 contract.
+All business paths below are prefixed /api/v1 and protected after 04. IDs are positive ints. The path variable names distinguish library exercise, routine placement, and session exercise. Request validators return 422 for invalid bound input; malformed JSON/type binding returns 400. Both use ValidationProblemDetails.
 
 | Slice | Method / path | Request -> result |
 | --- | --- | --- |
 | 01 | GET /health (unprefixed) | Public readiness 200/503 text |
 | 04 | GET /me | UserDto |
 | 04 | PUT /me/preferences | PreferencesRequest -> UserDto |
-| 05 | GET /exercises | includeArchived=false -> ExerciseDto[] |
-| 05 | POST /exercises | ExerciseWriteRequest -> 201 ExerciseDto |
+| 05 | GET /exercises | Visible global + own custom ExerciseDto[] |
+| 05 | POST /exercises | Create own custom -> 201 ExerciseDto |
 | 05 | GET /exercises/{id} | ExerciseDto |
-| 05 | PUT /exercises/{id} | ExerciseWriteRequest -> ExerciseDto |
-| 15 | DELETE /exercises/{id} | Archive 204; active usage 409 |
+| 05 | PUT /exercises/{id} | Replace own custom metadata -> ExerciseDto |
+| 15 | DELETE /exercises/{id} | Own custom archive; global 403; usage 409 |
 | 06 | GET /routines | includeArchived=false -> RoutineSummaryDto[] |
 | 06 | POST /routines | NameDescriptionRequest -> 201 RoutineDto |
 | 06 | GET /routines/{id} | Ordered RoutineDto |
@@ -1315,6 +1424,21 @@ All business paths below are prefixed /api/v1 and protected after 04. IDs are po
 | 15 | PUT /routines/{id}/exercises/order | ReorderRequest -> RoutineDto |
 
 Use versioned CreatedAtAction links for creates. PUT replaces the editable fields represented by its request. Route mismatch/foreign resource is 404; owned archived state is 409 for writes. Repeated owned archives return 204.
+
+---page---
+# API reference - Global catalog administration
+
+All routes use the /api/v1 prefix. AdminExercisesController requires the native Admin policy. Ordinary authenticated callers receive 403; missing/invalid bearer receives 401. Existing GET /exercises and GET /exercises/{id} supply catalog reads for everyone.
+
+| Slice | Method / route | Contract |
+| --- | --- | --- |
+| 05 | POST /admin/exercises | ExerciseWriteRequest -> 201 global ExerciseDto |
+| 05 | PUT /admin/exercises/{id} | Replace global metadata -> ExerciseDto |
+| 15 | DELETE /admin/exercises/{id} | Global archive -> 204; active usage 409 |
+
+Admin writes match global rows only; a private/missing ID returns 404. Archived metadata update returns 409. Creation Location points to the shared versioned detail route. Archive is blocked by active usage in any account, with a generic response that reveals no private routine/user details.
+
+Owner, role and scope are never writable request fields. Personal creation always sets the verified caller's owner, while global creation sets a null owner. The DTO's isGlobal is derived from persistence. Neither role nor global ownership gives access to other users' custom exercises.
 
 ---page---
 # API reference - sets, schedule, sessions
@@ -1347,7 +1471,7 @@ Timestamps are UTC ISO 8601, scheduledDate is YYYY-MM-DD. Warmup/working types, 
 ---page---
 # Contract reference - requests
 
-These are wire field definitions, not duplicate types to paste into every feature. Use DataAnnotations on actual request types. Required numeric inputs must detect omission (nullable + [Required], then range validation); do not accidentally turn missing reps/value into valid zero. Optional fields have explicit null semantics.
+These are wire field definitions, not duplicate types to paste into every feature. Create a FluentValidation validator beside each actual request type, registered automatically in DI. Required numeric inputs must detect omission (nullable + NotNull, then range validation); do not accidentally turn missing reps/value into valid zero. Optional fields have explicit null semantics.
 
 ```text
 PreferencesRequest
@@ -1398,7 +1522,7 @@ Nested collections are ordered and nonnull. UTC instant fields map from internal
 ```text
 UserDto: id, clerkUserId, timeZone, measurementSystem
 WeightDto: value(decimal), unit(lb|kg)
-ExerciseDto: id, name, description, brandName?, archivedAt?
+ExerciseDto: id, name, description, brandName?, isGlobal, archivedAt?
 RoutineSummaryDto: id, name, description, archivedAt?
 RoutineSetDto:
   id, position, setType, targetRepsMin, targetRepsMax,
@@ -1458,6 +1582,20 @@ The following SQL is a schema contract for reviewed EF mappings and generated Po
 
 
 ---page---
+# Primary references - Authorization and shared exercises
+
+17. Microsoft: native role policies and RequireRole. https://learn.microsoft.com/en-us/aspnet/core/security/authorization/roles?view=aspnetcore-10.0
+18. Microsoft: NameClaimType and RoleClaimType for verified claims. https://learn.microsoft.com/en-us/aspnet/core/security/authentication/claims?view=aspnetcore-10.0
+19. Clerk: metadata-based admin roles, adapted to this API's native policy. https://clerk.com/docs/guides/secure/basic-rbac
+20. Clerk: individual metadata fields as compact session claims and refresh limitations. https://clerk.com/docs/guides/users/extending and https://clerk.com/docs/guides/sessions/customize-session-tokens
+21. PostgreSQL 18: stored generated columns and composite foreign-key/null behavior. https://www.postgresql.org/docs/18/ddl-generated-columns.html and https://www.postgresql.org/docs/18/ddl-constraints.html
+22. EF Core: key properties cannot use generation on update. https://github.com/dotnet/efcore/blob/v10.0.0/src/EFCore/Infrastructure/ModelValidator.cs
+23. FluentValidation: async controller validation and assembly-based DI registration. https://docs.fluentvalidation.net/en/latest/aspnet.html and https://docs.fluentvalidation.net/en/latest/di.html
+24. NuGet: pinned FluentValidation.DependencyInjectionExtensions 12.1.1. https://www.nuget.org/packages/FluentValidation.DependencyInjectionExtensions/12.1.1
+
+The global/private product model, fixed-scope endpoints and slice timing are project decisions. These sources support the framework mechanisms; they do not authorize extra role management screens, custom handlers, seed catalogs, or future code.
+
+---page---
 # Schema contract - CreateUsers / introduced in 01
 
 ```sql
@@ -1479,14 +1617,14 @@ CREATE TABLE users (
 ```sql
 CREATE TABLE exercises (
     id              integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    user_id         integer NOT NULL REFERENCES users(id),
+    user_id         integer REFERENCES users(id),
     name            text NOT NULL,
     description     text NOT NULL DEFAULT '',
     brand_name      text CHECK (brand_name IS NULL OR
                         (btrim(brand_name) <> '' AND length(brand_name) <= 100)),
     archived_at     timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (id, user_id),
+    CHECK (user_id IS NULL OR user_id > 0),
     CHECK (btrim(name) <> '')
 );
 CREATE INDEX exercises_active_list
@@ -1494,6 +1632,7 @@ CREATE INDEX exercises_active_list
     WHERE archived_at IS NULL;
 ```
 
+Null user_id is global; a positive user_id references its custom owner. Use restrictive deletion. AddExercises does not add placement/snapshot tables or their derived access key. Only authorized admin routes create globals; the normal route sets its owner from CurrentUser. No owner or scope transfer operation is exposed.
 
 ---page---
 # Schema contract - AddRoutines / introduced in 06
@@ -1516,6 +1655,39 @@ CREATE INDEX routines_active_list
 
 
 ---page---
+# Schema contract - Library access key / introduced in 07
+
+AddRoutineExercises extends the existing exercise table before creating placements. A nullable (exercise_id,user_id) foreign key would skip checking global NULL values. Use a nonnullable derived key with a native composite FK/check instead [21].
+
+```sql
+ALTER TABLE exercises
+    ADD COLUMN access_scope_id integer
+    GENERATED ALWAYS AS (coalesce(user_id, 0)) STORED;
+ALTER TABLE exercises
+    ADD CONSTRAINT exercises_id_access_scope_key
+    UNIQUE (id, access_scope_id);
+```
+
+Zero denotes global scope internally; a positive value is the real custom owner's ID. Zero is not an entity ID or user row. Requests and DTOs never contain this key. A placement/session child stores exercise_scope_id, with CHECK (exercise_scope_id = 0 OR exercise_scope_id = user_id), and references the composite library key.
+
+In EF, explicitly configure the shadow key and its immutable generation behavior. HasComputedColumnSql alone defaults to generation on update, which EF rejects for key properties [22]. This partial mapping uses Microsoft.EntityFrameworkCore.Metadata.PropertySaveBehavior:
+
+```csharp
+var scope = exercise.Property<int>("AccessScopeId")
+    .HasColumnName("access_scope_id")
+    .HasComputedColumnSql("coalesce(user_id, 0)", stored: true)
+    .ValueGeneratedOnAdd();
+scope.Metadata.SetBeforeSaveBehavior(PropertySaveBehavior.Ignore);
+exercise.HasAlternateKey("Id", "AccessScopeId");
+```
+
+Owner/scope never change after creation, so EF reads the generated key on insert and keeps it fixed. Map the child's scope as a nonnullable int and its composite relationship with DeleteBehavior.Restrict. Native EF migration metadata tracks these mappings.
+
+Assign child scope from the selected visible library row (UserId ?? 0). A forged private exercise under global scope 0 fails the FK; another user's private scope fails the owner check. Existing parent/child tenant FKs stay in place. Owner/scope remain immutable through API requests.
+
+Do this in 07, when the first child reference exists; copy the validated key into SessionExercise in 10. Keep historical references and restrictive deletion. No trigger, generic permissions table, or custom database access layer is required.
+
+---page---
 # Schema contract - AddRoutineExercises / introduced in 07
 
 ```sql
@@ -1524,6 +1696,7 @@ CREATE TABLE routine_exercises (
     user_id                 integer NOT NULL REFERENCES users(id),
     routine_id              integer NOT NULL,
     exercise_id             integer NOT NULL,
+    exercise_scope_id       integer NOT NULL,
     position                integer NOT NULL CHECK (position > 0),
     description             text NOT NULL DEFAULT '',
     default_rest_seconds    integer NOT NULL DEFAULT 120
@@ -1532,8 +1705,9 @@ CREATE TABLE routine_exercises (
     UNIQUE (id, user_id),
     FOREIGN KEY (routine_id, user_id)
         REFERENCES routines(id, user_id),
-    FOREIGN KEY (exercise_id, user_id)
-        REFERENCES exercises(id, user_id)
+    CHECK (exercise_scope_id = 0 OR exercise_scope_id = user_id),
+    FOREIGN KEY (exercise_id, exercise_scope_id)
+        REFERENCES exercises(id, access_scope_id)
 );
 CREATE UNIQUE INDEX routine_exercises_active_position
     ON routine_exercises(routine_id, position)
@@ -1641,6 +1815,7 @@ CREATE TABLE session_exercises (
     user_id                     integer NOT NULL REFERENCES users(id),
     session_id                  integer NOT NULL,
     exercise_id                 integer NOT NULL,
+    exercise_scope_id           integer NOT NULL,
     source_routine_exercise_id  integer NOT NULL,
     -- Copied exercise metadata.
     exercise_name               text NOT NULL,
@@ -1655,8 +1830,9 @@ CREATE TABLE session_exercises (
     UNIQUE (id, session_id, user_id),
     FOREIGN KEY (session_id, user_id)
         REFERENCES workout_sessions(id, user_id),
-    FOREIGN KEY (exercise_id, user_id)
-        REFERENCES exercises(id, user_id),
+    CHECK (exercise_scope_id = 0 OR exercise_scope_id = user_id),
+    FOREIGN KEY (exercise_id, exercise_scope_id)
+        REFERENCES exercises(id, access_scope_id),
     FOREIGN KEY (source_routine_exercise_id, user_id)
         REFERENCES routine_exercises(id, user_id)
 );

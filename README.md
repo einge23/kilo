@@ -1,8 +1,14 @@
 # Kilo
 
-The current implementation covers the foundation (slice 01), verified release images (slice 02), and verified local Compose stack (slice 03) of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, and a separate EF migrator. Clerk and business endpoints arrive in later slices. The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
+The current implementation covers slices 01-05 of the [workout tracker plan](docs/workout-tracker-plan.md): controller host, URL API versioning, scoped EF Core/Postgres persistence, readiness, separate EF migrator, release images, local Compose, Clerk identity/preferences, the global/private exercise library. Verification is recorded in [slice 04](docs/slice-04-verification.md) and [slice 05](docs/slice-05-verification.md). The [EF transition record](docs/ef-core-transition.md) summarizes the completed transition and cleanup checks.
 
 The [PDF workbook](output/pdf/workout-tracker-dotnet10-revised-plan.pdf) contains the cumulative implementation guide. Agents must follow [AGENTS.md](AGENTS.md). Edit the plan's Markdown source and regenerate the PDF with `python docs/build_workout_plan.py` (requires ReportLab and pypdf).
+
+## Exercise library (slice 05)
+
+GET `/api/v1/exercises` returns active global entries plus the caller's custom entries, ordered by name then ID; `?includeArchived=true` includes visible archives. GET `/api/v1/exercises/{id}` reads visible detail. POST/PUT on personal routes creates/replaces only the caller's custom metadata. Global POST/PUT uses `/api/v1/admin/exercises` and the native ASP.NET Core `Admin` policy (`RequireAuthenticatedUser()` and `RequireRole("admin")`); JWT roles map to the signed Clerk `role` claim. Admins cannot access another account's private entries. Both routes share name/description/brand validation and return an `isGlobal` DTO without owner IDs.
+
+Run the separate migrator to apply additive `20261008230628_AddExercises`; the API never migrates on startup. Archive endpoints remain slice 15, and placements/snapshots arrive with their own slices. The [slice-05 record](docs/slice-05-verification.md) covers 72 passing tests, migration upgrade/replay, and refreshed image/Compose gates.
 
 ## Release images (slice 02)
 
@@ -29,14 +35,14 @@ Base digests pin official multi-platform manifests. Review updates using `docker
 
 ## Local Docker stack
 
-Copy `.env.example` to `.env`, choose a local password, then run:
+Copy `.env.example` to `.env`, choose a local password, and set `CLERK_ISSUER` and `CLERK_AUTHORIZED_PARTY` for your Clerk instance and frontend origin, then run:
 
 ```powershell
 docker compose up --build -d
 Invoke-WebRequest http://127.0.0.1:8080/health
 ```
 
-Compose waits for Postgres, runs the migrator once, then starts the API. The development override exposes API 8080 and Postgres 5432 on loopback. The base `compose.yaml` publishes no ports; production roles, TLS, and deployment are later slices. `/openapi/v1.json` is available in Development. No business controller is deployed yet.
+Compose waits for Postgres, runs the migrator once, then starts the API. The development override exposes API 8080 and Postgres 5432 on loopback. The base `compose.yaml` publishes no ports; production roles, TLS, and deployment are later slices. `/openapi/v1.json` is available in Development. `GET /api/v1/me` and `PUT /api/v1/me/preferences` require a valid Clerk bearer token.
 
 An existing Postgres volume keeps its existing database names/passwords. Match its credentials rather than deleting the volume. New EF migrations are additive; never edit an already-applied migration. For a new release, run its migrator freshly rather than relying on a previous container's success.
 
@@ -68,6 +74,9 @@ Both executables use `ConnectionStrings:Postgres` but have separate user-secret 
 $env:DOTNET_ENVIRONMENT = "Development"
 dotnet user-secrets set "ConnectionStrings:Postgres" "<connection>" --project Kilo
 dotnet user-secrets set "ConnectionStrings:Postgres" "<connection>" --project Kilo.Migrations
+# Public identity configuration belongs to the API only:
+dotnet user-secrets set "Clerk:Issuer" "https://<instance>.clerk.accounts.dev" --project Kilo
+dotnet user-secrets set "Clerk:AuthorizedParties:0" "http://localhost:3000" --project Kilo
 dotnet restore Kilo.slnx --locked-mode
 dotnet build Kilo.slnx --no-restore
 dotnet run --project Kilo.Migrations --no-build
@@ -84,7 +93,45 @@ Compose uses password authentication with `GSS Encryption Mode=Disable` to avoid
 dotnet test Kilo.slnx --no-restore
 ```
 
-Configuration, native HTTP/versioning/validation, scoped context lifetime and model-snapshot consistency, and unavailable-readiness checks run without a database. The Postgres check reports **Skipped** until `KILO_TEST_POSTGRES` supplies an admin connection with CREATE DATABASE permission. It creates and drops its own uniquely named test databases; it never migrates the supplied admin database. With that variable set, it verifies migrations twice, identity/defaults, transactional rollback, cancellation, healthy readiness and database constraint enforcement.
+`Kilo.Tests/IntegrationTests/MeControllerTests.cs` runs happy-path HTTP checks against a disposable PostgreSQL 18.6 Testcontainer. Start Docker Desktop's Linux engine before running it; no connection string or Clerk credentials are required. The class fixture applies the real EF migrations, uses random container ports and credentials, and removes its container afterward. Each test uses a unique Clerk subject. `PreferencesRequestFaker` uses Bogus with per-instance seeds and valid IANA time zones.
+
+```powershell
+dotnet test Kilo.Tests/Kilo.Tests.csproj --no-restore --filter FullyQualifiedName~MeControllerTests
+```
+
+These tests verify first-request provisioning, existing-profile retrieval, both measurement systems, and preference persistence through subsequent GET requests and direct database checks. Their test-only authentication handler supplies the principal. They also check invalid preferences and isolation between two subjects.
+
+`ClerkAuthenticationTests` uses the real JwtBearer handler with RSA-signed fixture tokens and an in-process HTTP transport serving OIDC discovery and public JWKS documents. It covers concurrent provisioning, rejected signatures/claims/algorithms, 403 policy denials, key rotation, cached-key operation during outages, cold-cache 503 responses, CORS, public readiness, and authenticated production OpenAPI exclusion. It does not contact a real Clerk account; the image gate separately checks outbound trusted HTTPS.
+
+`KiloApiFactory` shares disposable Postgres setup between Me and exercise feature tests; its subject/role headers are test-only and have no production authentication meaning. `ExercisesControllerTests` uses `ExerciseWriteRequestFaker` for global/custom CRUD, versioned Location links, fixed scope, isolation including admins, brand normalization/bounds, native validation, archived filtering and database constraints. Native Clerk tests also verify signed admin roles, rejected/missing roles, and invalid/forged tokens at exercise endpoints.
+
+`IntegrationTests/FoundationTests.cs` checks configuration, native HTTP/versioning/validation, scoped contexts, model-snapshot consistency, and bounded unavailable readiness. Its Postgres check starts its own Testcontainer and verifies migration replay, identity/defaults, rollback, cancellation, healthy readiness, and database constraints. Docker is required for the full suite; there is no external admin connection or silently skipped database check. The migrator subprocess has a 45-second deadline and is terminated if it exceeds that deadline.
+
+## Request validation
+
+Each API request type has a FluentValidation validator in its feature's `Requests` folder. `AddKiloApi` automatically registers validators from the API assembly with `AddValidatorsFromAssemblyContaining<Program>()`. Controllers inject `IValidator<TRequest>` and await `ValidateAsync` with cancellation before user provisioning or writes; this also supports async rules. Request DataAnnotations and MVC implicit required validation are replaced by these rules.
+
+Rule failures return HTTP 422 `application/problem+json` with `type`, `title`, `status`, `instance`, camelCase `errors`, and `traceId` through the shared native `RequestValidationProblem` extension. Invalid JSON, absent bodies and incompatible bound types remain native HTTP 400; authorization stays 401/403 and route mismatches stay 404. Validators do not replace ownership checks or database constraints. See [validation verification](docs/request-validation-verification.md).
+
+## Clerk configuration and failure behavior
+
+The API requires an HTTPS `Clerk:Issuer` and at least one `Clerk:AuthorizedParties` origin. Compose maps the corresponding `.env` variables into the API; the migrator needs neither. Outside Compose, use `Clerk__Issuer` and indexed `Clerk__AuthorizedParties__0` environment keys. Set `Clerk__Audience` only when your token setup defines an audience; omission leaves audience validation disabled. Add additional origins with further indexed keys. No Clerk secret API key is required for signature verification.
+
+`AddKiloClerk` uses native discovery, signing-key caching and rotation, RS256, expiration, issuer, optional audience, nonblank verified `sub`, and allowed `azp`. CORS separately grants the configured origins. A fallback policy protects routes, while health and Development OpenAPI explicitly allow anonymous access.
+
+Before validating a bearer token, the auth hook asks the native configuration manager for trusted metadata. A positively identified transport failure with no cached configuration becomes a sanitized 503. Cached configuration still permits native token validation: invalid signatures and unknown keys remain 401. No custom JWT parser, signing-key cache, or general exception-to-503 mapper is used. Cancellation is propagated; metadata HTTP calls have a 10-second timeout.
+
+An anonymous request to the absent Production OpenAPI route returns 401 because of the fallback policy. The image smoke check expects that response; the authenticated JWT integration check proves the route returns 404. Both checks are needed to verify the policy and route exclusion.
+
+## Clerk admin role setup
+
+For global administration, set the selected Clerk user's **public metadata** to `{"role":"admin"}` through the Dashboard or a trusted backend. Under **Sessions / Customize session token**, merge this top-level claim:
+
+```json
+{ "role": "{{user.public_metadata.role}}" }
+```
+
+Keep ordinary users without the admin role. Public metadata is server-controlled; client-writable unsafe metadata, request bodies, and headers do not grant roles. Refresh the session token after a role change; already issued tokens keep their claims until expiry. No local role table or per-request Clerk API lookup is used.
 
 ## EF migration development
 
@@ -111,4 +158,4 @@ If a retained database was created by the earlier SQL runner, ordinary EF migrat
 
 `User` is now in `Kilo.Persistence/Entities/User.cs`. Its namespace is `Kilo.Persistence.Entities`. `OrganizeUserEntity` records the namespace and approved length annotations in generated metadata without changing database columns; the applied `CreateUsers` migration remains intact. Time zones retain their unrestricted text mapping, supporting IANA names such as `America/Phoenix`.
 
-The API never migrates on startup. The migrator returns nonzero with a sanitized diagnostic on failure. Health uses the native `Healthy`/`Unhealthy` response with 200/503; HTTP errors use ProblemDetails and standard MVC validation returns 400.
+The API never migrates on startup. The migrator returns nonzero with a sanitized diagnostic on failure. Health uses the native `Healthy`/`Unhealthy` response with 200/503; HTTP errors use ProblemDetails. FluentValidation request-rule failures return 422 ValidationProblemDetails; malformed JSON/type binding returns native 400.

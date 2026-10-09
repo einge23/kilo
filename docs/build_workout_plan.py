@@ -105,7 +105,7 @@ def chrome(canvas, doc):
     canvas.setFillColor(GRAY)
     canvas.drawString(54, 763, 'KILO / .NET 10 / CUMULATIVE IMPLEMENTATION')
     canvas.setFont('Helvetica', 8)
-    canvas.drawString(54, 31, 'REVISED OCTOBER 7, 2026   /   BUILD -> VERIFY -> RECORD')
+    canvas.drawString(54, 31, 'REVISED OCTOBER 8, 2026   /   BUILD -> VERIFY -> RECORD')
     canvas.drawRightString(558, 31, str(doc.page))
     canvas.restoreState()
 

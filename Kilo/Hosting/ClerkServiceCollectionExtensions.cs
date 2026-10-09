@@ -1,4 +1,4 @@
-using Kilo.Hosting.Options;
+﻿using Kilo.Hosting.Options;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Cors.Infrastructure;
@@ -128,7 +128,10 @@ public static class ClerkServiceCollectionExtensions
             .SetFallbackPolicy(
                 new AuthorizationPolicyBuilder()
                     .RequireAuthenticatedUser()
-                    .Build());
+                    .Build())
+            .AddPolicy("Admin", policy => policy
+                .RequireAuthenticatedUser()
+                .RequireRole("admin"));
 
         services.AddCors();
 
